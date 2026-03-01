@@ -6,11 +6,11 @@
 
 ### On Your PC (Desktop Host)
 
-| Requirement | Version | Check Command |
-|-------------|---------|---------------|
-| **.NET SDK** | 10.0+ | `dotnet --version` |
-| **GitHub Copilot CLI** | Latest | `copilot --version` |
-| **Git** | Any | `git --version` |
+| Requirement                       | Version | Check Command                                |
+| --------------------------------- | ------- | -------------------------------------------- |
+| **.NET SDK**                      | 10.0+   | `dotnet --version`                           |
+| **GitHub Copilot CLI**            | Latest  | `copilot --version`                          |
+| **Git**                           | Any     | `git --version`                              |
 | **Android SDK** (if building APK) | API 24+ | `dotnet workload list` should show `android` |
 
 Install .NET MAUI workloads:
@@ -44,22 +44,22 @@ copilot auth status
 
 ### Home (LAN) Scenario
 
-| What | Port | Direction |
-|------|------|-----------|
+| What            | Port           | Direction  |
+| --------------- | -------------- | ---------- |
 | WsBridge server | **4322** (TCP) | Phone → PC |
 
 Both devices must be on the **same WiFi network**. Your PC's local IP (e.g., `192.168.1.x`) must be reachable from the phone.
 
 ### Internet (Mobile Data) Scenario
 
-Choose one:
+Choose one: (default DevTunnel)
 
-| Method | Requirements |
-|--------|-------------|
-| **DevTunnel** (Microsoft) | `devtunnel` CLI installed + Microsoft/GitHub account |
-| **ngrok** | `ngrok` CLI installed + ngrok account |
-| **Tailscale** | Tailscale installed on both PC and phone |
-| **Port forwarding** | Router admin access — **not recommended** (security risk) |
+| Method                    | Requirements                                              |
+| ------------------------- | --------------------------------------------------------- |
+| **DevTunnel** (Microsoft) | `devtunnel` CLI installed + Microsoft/GitHub account      |
+| **ngrok**                 | `ngrok` CLI installed + ngrok account                     |
+| **Tailscale**             | Tailscale installed on both PC and phone                  |
+| **Port forwarding**       | Router admin access — **not recommended** (security risk) |
 
 #### Installing DevTunnel CLI
 

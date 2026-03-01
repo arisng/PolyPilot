@@ -39,9 +39,11 @@ The bridge server starts on port 4322. You'll see:
 ### Option B: Manual Entry
 
 1. On your phone, open PolyPilot → Settings.
-2. Enter the **Remote URL**: `http://<your-pc-ip>:4322`
-3. Enter the **Remote Token**: your server password.
+2. Enter the **LAN URL**: `http://<your-pc-ip>:4322`
+3. Enter the **LAN Token**: your server password.
 4. Tap **Save & Reconnect**.
+
+> Important: For LAN-only setup, use the LAN fields. `Remote URL` and `Remote Token` are for tunnel/internet access. Mixing these fields can cause authentication mismatches.
 
 To find your PC's IP:
 ```bash
@@ -63,6 +65,8 @@ On your phone you should see:
 - Live-streaming chat messages when agents are working
 
 Try sending a prompt from your phone — it should execute on the desktop and stream back in real-time.
+
+If the phone shows `The server returned status code 401 when status code 101 was expected`, see [Troubleshooting](troubleshooting.md#websocket-auth-fails-401-expected-101).
 
 ## Authentication
 

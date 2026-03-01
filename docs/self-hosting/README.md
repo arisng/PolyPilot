@@ -50,6 +50,12 @@
 4. **Phone** connects in Remote mode — all sessions, chats, and squads appear live.
 5. You type prompts and steer agents from your phone; the desktop executes them.
 
+## Common Gotcha
+
+- For same-WiFi setup, enter credentials in **LAN URL** and **LAN Token** fields on phone settings.
+- Use **Remote URL** and **Remote Token** only for tunnel/internet access.
+- If you see `401 when 101 expected`, the bridge is reachable but WebSocket auth failed. Use **Save & Reconnect** on desktop and phone to resync active token state.
+
 ---
 
 **Next step:** [Prerequisites](prerequisites.md) →

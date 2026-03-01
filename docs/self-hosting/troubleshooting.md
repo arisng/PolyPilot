@@ -14,7 +14,7 @@
 | Correct IP? | Run `hostname -I` (Linux) or `ipconfig getifaddr en0` (macOS) on your PC. IPs change on DHCP. |
 | Bridge running? | Desktop → Settings → Direct Sharing should show a green indicator. |
 | Firewall blocking? | Open port 4322 — see [Prerequisites](prerequisites.md#firewall-notes). |
-| Password correct? | The "Remote Token" on phone must match "Server Password" on desktop exactly. |
+| Password correct? | The "LAN Token" on phone must match "Server Password" on desktop exactly. |
 
 **Quick diagnostic:**
 ```bash
@@ -23,6 +23,30 @@ curl -v http://<your-pc-ip>:4322/
 # Should return 200 OK with body "WsBridge OK" — the port IS open and bridge is running
 # If connection refused → firewall or bridge not running
 ```
+
+### WebSocket Auth Fails (`401 expected 101`)
+
+**Symptoms:**
+- Phone shows: `The server returned status code 401 when status code 101 was expected`
+- HTTP health check may still return `200 WsBridge OK`
+
+**What this means:**
+- Network path is usually fine.
+- Authentication failed during the WebSocket upgrade.
+
+**Most common cause:**
+- Desktop and phone are not using the same active token state (stale settings on one side), or LAN credentials were entered into `Remote` fields.
+
+**Fix sequence (works reliably):**
+1. On desktop: Settings → Direct Sharing → set (or re-set) **Server Password**.
+2. Click **Save & Reconnect** (forces bridge to reload active auth state).
+3. On phone: enter **LAN URL** and **LAN Token** (not Remote fields) for LAN-only use.
+4. Tap **Save & Reconnect** on phone.
+5. If still failing, re-scan the desktop QR code to refresh URL/token pairs together.
+
+**Why this is confusing:**
+- `curl http://<pc-ip>:4322/` can return `200` while WebSocket auth still fails.
+- `200` verifies reachability, not WebSocket authorization.
 
 ### Phone Can't Connect (Tunnel)
 
