@@ -1509,6 +1509,92 @@ public class MultiAgentRegressionTests
 
     #endregion
 
+    #region Resume Resiliency
+
+    [Fact]
+    public void MonitorAndSynthesize_ShouldRedispatchUnstartedWorkers()
+    {
+        // When the app restarts and workers never started (TaskCanceledException killed dispatch),
+        // MonitorAndSynthesizeAsync should detect idle workers with no post-dispatch response
+        // and re-dispatch them instead of reporting "no response found".
+        var source = File.ReadAllText(Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs"));
+
+        var startIdx = source.IndexOf("private async Task MonitorAndSynthesizeAsync");
+        Assert.True(startIdx >= 0, "MonitorAndSynthesizeAsync method not found in source");
+        var monitorSection = source.Substring(startIdx);
+        var sectionEnd = monitorSection.IndexOf("#endregion");
+        if (sectionEnd < 0) sectionEnd = Math.Min(monitorSection.Length, 5000);
+        var block = monitorSection.Substring(0, sectionEnd);
+
+        // Must track unstarted workers
+        Assert.Contains("unstartedWorkers", block);
+        // Must re-dispatch them
+        Assert.Contains("Re-dispatching", block);
+        Assert.Contains("ExecuteWorkerAsync", block);
+    }
+
+    [Fact]
+    public async Task RetryOrchestration_MissingGroup_DoesNothing()
+    {
+        var svc = CreateService();
+        // Should not throw — just return silently
+        await svc.RetryOrchestrationAsync("nonexistent-group-id");
+    }
+
+    [Fact]
+    public async Task RetryOrchestration_NoMembers_DoesNothing()
+    {
+        var svc = CreateService();
+        CopilotService.SetBaseDirForTesting(TestSetup.TestBaseDir);
+
+        var group = svc.CreateMultiAgentGroup("EmptyGroup", MultiAgentMode.OrchestratorReflect);
+        // No sessions added — group has no members
+        await svc.RetryOrchestrationAsync(group.Id);
+        // Should not throw
+    }
+
+    [Fact]
+    public void RetryOrchestration_ResetsReflectState()
+    {
+        // RetryOrchestrationAsync should reset the reflect state so the loop can re-enter.
+        // If ReflectionState.IsActive is false (loop completed), retry should re-activate it.
+        var source = File.ReadAllText(Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs"));
+
+        var startIdx = source.IndexOf("public async Task RetryOrchestrationAsync");
+        Assert.True(startIdx >= 0, "RetryOrchestrationAsync method not found in source");
+        var retrySection = source.Substring(startIdx);
+        var sectionEnd = retrySection.IndexOf("/// <summary>");
+        if (sectionEnd < 0) sectionEnd = Math.Min(retrySection.Length, 3000);
+        var block = retrySection.Substring(0, sectionEnd);
+
+        // Must reset IsActive
+        Assert.Contains("IsActive = true", block);
+        // Must reset iteration counter
+        Assert.Contains("CurrentIteration = 0", block);
+        // Must reset GoalMet
+        Assert.Contains("GoalMet = false", block);
+    }
+
+    [Fact]
+    public void RetryOrchestration_FallsBackToResumePrompt()
+    {
+        // When no explicit prompt is given and no user message found in history,
+        // RetryOrchestrationAsync should use a fallback resume instruction.
+        var source = File.ReadAllText(Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Organization.cs"));
+
+        var startIdx = source.IndexOf("public async Task RetryOrchestrationAsync");
+        Assert.True(startIdx >= 0, "RetryOrchestrationAsync method not found in source");
+        var retrySection = source.Substring(startIdx);
+        var sectionEnd = retrySection.IndexOf("/// <summary>");
+        if (sectionEnd < 0) sectionEnd = Math.Min(retrySection.Length, 3000);
+        var block = retrySection.Substring(0, sectionEnd);
+
+        // Must have a fallback prompt
+        Assert.Contains("Continue with any pending work", block);
+    }
+
+    #endregion
+
     #region GetOrchestratorGroupId
 
     [Fact]
