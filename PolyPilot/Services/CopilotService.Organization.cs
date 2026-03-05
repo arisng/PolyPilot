@@ -207,14 +207,14 @@ public partial class CopilotService
     /// Skips work if the active session set hasn't changed since last reconciliation.
     /// </summary>
     private int _lastReconcileSessionHash;
-    internal void ReconcileOrganization()
+    internal void ReconcileOrganization(bool allowPruning = true)
     {
         var activeNames = _sessions.Where(kv => !kv.Value.Info.IsHidden).Select(kv => kv.Key).ToHashSet();
 
         // Safety: skip reconciliation during startup when sessions haven't been restored yet.
         // LoadOrganization loads the org before RestorePreviousSessionsAsync populates _sessions,
         // so reconciling then would prune all sessions. Use IsRestoring as the precise scope guard.
-        if (IsRestoring)
+        if (IsRestoring && allowPruning)
         {
             Debug("ReconcileOrganization: skipping — session restore in progress");
             return;
@@ -232,7 +232,10 @@ public partial class CopilotService
         var currentHash = activeNames.Count;
         unchecked { foreach (var name in activeNames) currentHash += name.GetHashCode() * 31; }
         if (currentHash == _lastReconcileSessionHash && currentHash != 0) return;
-        _lastReconcileSessionHash = currentHash;
+        // Only update the hash when doing a full reconciliation (with pruning).
+        // Additive-only calls (allowPruning=false) during restore must not poison the cache,
+        // or the post-restore full reconciliation will be skipped via hash match. (PR #284 review)
+        if (allowPruning) _lastReconcileSessionHash = currentHash;
         bool changed = false;
 
         // Build lookup of multi-agent group IDs so we can protect their sessions
@@ -365,13 +368,16 @@ public partial class CopilotService
                 .Select(m => m.SessionName));
 
         // Remove metadata only for sessions that are truly gone (not in any known set)
-        var toRemove = Organization.Sessions.Where(m => !knownNames.Contains(m.SessionName) && !protectedNames.Contains(m.SessionName)).ToList();
-        if (toRemove.Count > 0)
+        if (allowPruning)
         {
-            Debug($"ReconcileOrganization: pruning {toRemove.Count} sessions: {string.Join(", ", toRemove.Select(m => m.SessionName))}");
-            changed = true;
+            var toRemove = Organization.Sessions.Where(m => !knownNames.Contains(m.SessionName) && !protectedNames.Contains(m.SessionName)).ToList();
+            if (toRemove.Count > 0)
+            {
+                Debug($"ReconcileOrganization: pruning {toRemove.Count} sessions: {string.Join(", ", toRemove.Select(m => m.SessionName))}");
+                changed = true;
+            }
+            Organization.Sessions.RemoveAll(m => !knownNames.Contains(m.SessionName) && !protectedNames.Contains(m.SessionName));
         }
-        Organization.Sessions.RemoveAll(m => !knownNames.Contains(m.SessionName) && !protectedNames.Contains(m.SessionName));
 
         if (changed) SaveOrganization();
     }
