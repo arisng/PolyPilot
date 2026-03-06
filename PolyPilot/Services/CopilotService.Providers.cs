@@ -293,13 +293,14 @@ public partial class CopilotService
         var members = provider.GetMembers();
         var prefix = $"__{provider.ProviderId}_";
         var suffix = "__";
+        var leaderName = $"__{provider.ProviderId}__";
 
         // Expected session names for current members
         var expectedNames = members.Select(m => $"{prefix}{m.Id}{suffix}").ToHashSet();
 
-        // Remove stale member sessions
+        // Remove stale member sessions (but never the leader)
         foreach (var existing in _sessions.Keys
-            .Where(k => k.StartsWith(prefix) && k.EndsWith(suffix) && !expectedNames.Contains(k))
+            .Where(k => k != leaderName && k.StartsWith(prefix) && k.EndsWith(suffix) && !expectedNames.Contains(k))
             .ToList())
         {
             _sessions.TryRemove(existing, out _);
