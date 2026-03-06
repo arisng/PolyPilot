@@ -11,10 +11,12 @@
 @{
     var isCompleted = IsCompleted;
     var cardClass = Session.IsProcessing ? "processing" : isCompleted ? "completed" : "idle";
+    var providerDisplayName = CopilotService.GetProviderSessionDisplayName(Session.Name);
+    var displayName = providerDisplayName ?? Session.Name;
 }
 <div class="expanded-card @cardClass" data-session="@Session.Name">
     <div class="chat-header">
-        <h2 class="chat-header-title">@Session.Name</h2>
+        <h2 class="chat-header-title">@displayName</h2>
         @if (!string.IsNullOrEmpty(Session.GitBranch))
         {
             <span class="chat-header-branch" title="@Session.GitBranch">@Session.GitBranch</span>

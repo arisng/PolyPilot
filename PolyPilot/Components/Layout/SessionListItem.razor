@@ -9,6 +9,7 @@
     var isPinned = Meta?.IsPinned ?? false;
     var sessionDir = GetSessionDirectory();
     var provider = CopilotService.GetProviderForSession(Session.Name);
+    var providerDisplayName = CopilotService.GetProviderSessionDisplayName(Session.Name);
     var cssClass = IsActive ? "active" : 
                    IsCompleted ? "completed" :
                    Session.IsProcessing ? "busy" : "";
@@ -56,7 +57,7 @@
                 {
                     <span class="provider-icon" title="@provider.DisplayName">@provider.Icon</span>
                 }
-                <span class="session-name-text" @ondblclick="() => OnStartRename.InvokeAsync()" @ondblclick:stopPropagation="true">@Session.Name</span>
+                <span class="session-name-text" @ondblclick="() => OnStartRename.InvokeAsync()" @ondblclick:stopPropagation="true">@(providerDisplayName ?? Session.Name)</span>
                 @if (Meta?.Role == MultiAgentRole.Orchestrator)
                 {
                     <span class="role-badge orchestrator" title="Orchestrator">🎯</span>

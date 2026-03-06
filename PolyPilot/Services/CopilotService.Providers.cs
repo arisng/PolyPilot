@@ -296,6 +296,33 @@ public partial class CopilotService
         _sessionToProviderId.TryGetValue(sessionName, out var id) &&
         _providers.TryGetValue(id, out var p) ? p : null;
 
+    /// <summary>
+    /// Returns a human-readable display name for a provider session.
+    /// Leader sessions show LeaderDisplayName, member sessions show the member's Name.
+    /// Returns null for non-provider sessions.
+    /// </summary>
+    public string? GetProviderSessionDisplayName(string sessionName)
+    {
+        var provider = GetProviderForSession(sessionName);
+        if (provider == null) return null;
+
+        var leaderName = $"__{provider.ProviderId}__";
+        if (sessionName == leaderName)
+            return provider.LeaderDisplayName;
+
+        // Member session: extract member ID from __providerId_memberId__
+        var prefix = $"__{provider.ProviderId}_";
+        var suffix = "__";
+        if (sessionName.StartsWith(prefix) && sessionName.EndsWith(suffix))
+        {
+            var memberId = sessionName[prefix.Length..^suffix.Length];
+            var member = provider.GetMembers().FirstOrDefault(m => m.Id == memberId);
+            if (member != null) return member.Name;
+        }
+
+        return provider.DisplayName;
+    }
+
     /// <summary>Returns the provider for a group, or null if it's not a provider group.</summary>
     public ISessionProvider? GetProviderForGroup(string groupId)
     {
