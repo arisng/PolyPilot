@@ -60,9 +60,15 @@ public partial class CopilotService
             {
                 Id = groupId,
                 Name = provider.GroupName,
+                IsMultiAgent = false,
                 SortOrder = Organization.Groups.Any() ? Organization.Groups.Max(g => g.SortOrder) + 1 : 0
             };
             Organization.Groups.Add(group);
+        }
+        else
+        {
+            // Ensure provider groups are never treated as multi-agent
+            existingGroup.IsMultiAgent = false;
         }
 
         // Create leader session
