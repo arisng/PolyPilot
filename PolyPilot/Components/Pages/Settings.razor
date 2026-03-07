@@ -661,6 +661,10 @@
             case "cli.source":
                 cliSourceChanged = settings.CliSource != _initialCliSource;
                 break;
+            case "ui.editor":
+                CopilotService.Editor = settings.Editor;
+                CopilotService.NotifyStateChanged();
+                break;
         }
         SaveSettingsQuietly();
         StateHasChanged();
