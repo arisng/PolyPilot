@@ -1066,6 +1066,9 @@ public partial class CopilotService
         InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Planning, null));
 
         var planningPrompt = BuildOrchestratorPlanningPrompt(prompt, workerNames, group?.OrchestratorPrompt, group?.RoutingContext);
+        // Enable early dispatch for the non-reflect orchestrator flow too
+        if (_sessions.TryGetValue(orchestratorName, out var orchPlanning))
+            orchPlanning.EarlyDispatchOnWorkerBlocks = true;
         var planResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
 
         // Phase 2: Parse task assignments from orchestrator response, with retry loop.
@@ -1165,6 +1168,9 @@ public partial class CopilotService
             }
             var results = await Task.WhenAll(workerTasks);
 
+            // After early dispatch, the orchestrator may still be doing tool work.
+            await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
+
             // Phase 4: Synthesize — send worker results back to orchestrator
             InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing, null));
 
@@ -1218,6 +1224,7 @@ public partial class CopilotService
         {
             sb.AppendLine("You are a DISPATCHER ONLY. You do NOT have tools. You CANNOT write code, read files, or run commands yourself.");
             sb.AppendLine("Your ONLY job is to write @worker/@end blocks that assign work to your workers.");
+            sb.AppendLine("⚠️ This is a NEW request. Even if your conversation history shows previous work on a similar topic, you MUST delegate FRESH tasks to your workers. Previous results may be stale.");
         }
         else
         {
@@ -1263,7 +1270,10 @@ public partial class CopilotService
     internal static string BuildDelegationNudgePrompt(List<string> workerNames)
     {
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine("Your previous response did not contain any @worker delegation blocks. You MUST delegate work to your workers.");
+        sb.AppendLine("⚠️ CRITICAL: Your previous response did not contain any @worker delegation blocks.");
+        sb.AppendLine();
+        sb.AppendLine("You are a DISPATCHER. You CANNOT do the work yourself. Even if you believe the work is already done from a previous conversation, you MUST delegate FRESH work to your workers NOW.");
+        sb.AppendLine("Any previous results are STALE — the user is requesting a NEW evaluation. Ignore prior results and dispatch fresh tasks.");
         sb.AppendLine();
         sb.AppendLine($"Available workers ({workerNames.Count}): {string.Join(", ", workerNames)}");
         sb.AppendLine();
@@ -1273,7 +1283,7 @@ public partial class CopilotService
         sb.AppendLine("Describe the task here on a separate line.");
         sb.AppendLine("@end");
         sb.AppendLine();
-        sb.AppendLine("Do NOT do the work yourself. Output @worker blocks now.");
+        sb.AppendLine("Produce @worker blocks for ALL workers now. Do NOT explain, do NOT summarize previous work, ONLY output @worker blocks.");
         return sb.ToString();
     }
 
@@ -1340,6 +1350,48 @@ public partial class CopilotService
 
     private record WorkerResult(string WorkerName, string? Response, bool Success, string? Error, TimeSpan Duration);
 
+    /// <summary>
+    /// Wait for a session to finish processing (go idle). Used after early dispatch
+    /// resolves the orchestrator's TCS while it's still doing tool work — we must
+    /// wait for it to go idle before sending the next prompt (synthesis).
+    /// Uses a short inactivity threshold: if no SDK events for 60s, the session is
+    /// likely stuck in a "zero-idle" state and will be aborted.
+    /// </summary>
+    private async Task WaitForSessionIdleAsync(string sessionName, CancellationToken ct, int timeoutSeconds = 300)
+    {
+        if (!_sessions.TryGetValue(sessionName, out var state))
+            return;
+        if (!state.Info.IsProcessing)
+            return;
+
+        Debug($"[DISPATCH] Waiting for '{sessionName}' to go idle before sending next prompt...");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        const int inactivityThresholdSeconds = 60;
+
+        while (state.Info.IsProcessing && !ct.IsCancellationRequested && sw.Elapsed.TotalSeconds < timeoutSeconds)
+        {
+            // Check if the session has been quiet (no SDK events) for the inactivity threshold.
+            // This catches the "zero-idle" bug where the SDK never emits SessionIdleEvent.
+            var lastEventTicks = Interlocked.Read(ref state.LastEventAtTicks);
+            var secondsSinceLastEvent = (DateTime.UtcNow - new DateTime(lastEventTicks)).TotalSeconds;
+            if (secondsSinceLastEvent >= inactivityThresholdSeconds)
+            {
+                Debug($"[DISPATCH] '{sessionName}' no SDK events for {secondsSinceLastEvent:F0}s — aborting to proceed with synthesis");
+                await AbortSessionAsync(sessionName);
+                await Task.Delay(500, ct);
+                break;
+            }
+            await Task.Delay(1000, ct);
+        }
+        if (state.Info.IsProcessing)
+        {
+            Debug($"[DISPATCH] '{sessionName}' still processing after {sw.Elapsed.TotalSeconds:F1}s — aborting to allow synthesis");
+            await AbortSessionAsync(sessionName);
+            await Task.Delay(500, ct);
+        }
+        Debug($"[DISPATCH] '{sessionName}' now idle after {sw.Elapsed.TotalSeconds:F1}s");
+    }
+
     private async Task<WorkerResult> ExecuteWorkerAsync(string workerName, string task, string originalPrompt, CancellationToken cancellationToken)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1371,6 +1423,7 @@ public partial class CopilotService
         var workerPrompt = $"{identity}{worktreeNote}\n\nYour response will be collected and synthesized with other workers' responses.\n\n{sharedPrefix}## Original User Request (context)\n{originalPrompt}\n\n## Your Assigned Task\n{task}";
 
         const int maxRetries = 2;
+        var dispatchTime = DateTime.UtcNow;
         for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
             try
@@ -1399,6 +1452,21 @@ public partial class CopilotService
                             Debug($"[DISPATCH] Worker '{workerName}' revived with fresh session '{freshSession.SessionId}'");
                             response = await SendPromptAndWaitAsync(workerName, workerPrompt, cancellationToken, originalPrompt: originalPrompt);
                         }
+                    }
+                }
+
+                // Fallback: if response is still empty, try extracting from chat history.
+                // The SDK may have streamed content via delta events that ended up in history
+                // even though FlushedResponse/CurrentResponse were empty (e.g., watchdog completion).
+                if (string.IsNullOrWhiteSpace(response) && _sessions.TryGetValue(workerName, out var histState))
+                {
+                    var lastAssistant = histState.Info.History.ToArray()
+                        .LastOrDefault(m => m.Role == "assistant" && !string.IsNullOrWhiteSpace(m.Content)
+                            && m.Timestamp >= dispatchTime);
+                    if (lastAssistant != null)
+                    {
+                        response = lastAssistant.Content;
+                        Debug($"[DISPATCH] Worker '{workerName}' recovered {response!.Length} chars from chat history");
                     }
                 }
 
@@ -2059,10 +2127,13 @@ public partial class CopilotService
         Debug($"[WorktreeStrategy] Creating {preset.WorkerModels.Length} workers with strategy={strategy}, repoId={repoId}");
         for (int i = 0; i < preset.WorkerModels.Length; i++)
         {
-            var workerName = $"{teamName}-worker-{i + 1}";
+            var displayName = preset.WorkerDisplayNames != null && i < preset.WorkerDisplayNames.Length && preset.WorkerDisplayNames[i] != null
+                ? preset.WorkerDisplayNames[i]!
+                : $"worker-{i + 1}";
+            var workerName = $"{teamName}-{displayName}";
             { int suffix = 1;
               while (_sessions.ContainsKey(workerName) || Organization.Sessions.Any(s => s.SessionName == workerName))
-                  workerName = $"{teamName}-worker-{i + 1}-{suffix++}";
+                  workerName = $"{teamName}-{displayName}-{suffix++}";
             }
             var workerModel = preset.WorkerModels[i];
             var workerWorkDir = workerWorkDirs[i] ?? orchWorkDir ?? workingDirectory;
@@ -2241,6 +2312,7 @@ public partial class CopilotService
             return;
         }
 
+        var leftoverPrompts = new List<string>();
         try
         {
 
@@ -2297,6 +2369,12 @@ public partial class CopilotService
                 planPrompt = BuildReplanPrompt(reflectState.LastEvaluation ?? "Continue iterating.", workerNames, prompt, group.RoutingContext);
             }
 
+            // Enable early dispatch: if the orchestrator writes @worker blocks in an intermediate
+            // sub-turn (before finishing all tool rounds), FlushCurrentResponse will resolve the
+            // TCS immediately. This prevents the orchestrator from doing all the work itself.
+            if (_sessions.TryGetValue(orchestratorName, out var orchState))
+                orchState.EarlyDispatchOnWorkerBlocks = true;
+
             var planResponse = await SendPromptAndWaitAsync(orchestratorName, planPrompt, ct, originalPrompt: prompt);
             var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
             Debug($"[DISPATCH] '{orchestratorName}' reflect plan parsed: {rawAssignments.Count} raw assignments from {workerNames.Count} workers. Iteration={reflectState.CurrentIteration}, Response length={planResponse.Length}");
@@ -2312,6 +2390,9 @@ public partial class CopilotService
                     AddOrchestratorSystemMessage(orchestratorName,
                         "⚠️ No @worker assignments parsed from orchestrator response. Retrying...");
                     var nudgePrompt = BuildDelegationNudgePrompt(workerNames);
+                    // Re-enable early dispatch for the nudge attempt too
+                    if (_sessions.TryGetValue(orchestratorName, out var nudgeState))
+                        nudgeState.EarlyDispatchOnWorkerBlocks = true;
                     var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, ct, originalPrompt: prompt);
                     var nudgeAssignments = ParseTaskAssignments(nudgeResponse, workerNames);
                     Debug($"[DISPATCH] '{orchestratorName}' nudge parsed: {nudgeAssignments.Count} raw assignments. Response length={nudgeResponse.Length}");
@@ -2322,25 +2403,37 @@ public partial class CopilotService
                     }
                     else
                     {
-                        reflectState.ConsecutiveErrors++;
-                        if (reflectState.ConsecutiveErrors >= 3)
-                        {
-                            reflectState.IsStalled = true;
-                            reflectState.IsCancelled = true;
-                            break;
-                        }
-                        continue;
+                        // Nudge also failed — the orchestrator refuses to delegate (likely due to
+                        // stale history from a previous run). Force delegation by creating synthetic
+                        // @worker blocks that assign the original prompt to each worker.
+                        Debug($"[DISPATCH] Nudge failed, forcing delegation to all {workerNames.Count} workers");
+                        AddOrchestratorSystemMessage(orchestratorName,
+                            $"⚡ Orchestrator refused to delegate after nudge. Forcing dispatch to all {workerNames.Count} workers.");
+                        assignments = workerNames.Select(w => new TaskAssignment(w, prompt)).ToList();
+                        // Fall through to dispatch below
                     }
                 }
                 else
                 {
                     // Later iterations: orchestrator decided no more work needed —
-                    // but only declare GoalMet if no queued prompts produced @worker blocks
-                    if (queuedAssignments.Count == 0)
+                    // but only declare GoalMet if all workers have been dispatched
+                    var allDispatched = workerNames.All(w => dispatchedWorkers.Contains(w));
+                    var allAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
+                    if (queuedAssignments.Count == 0 && (allDispatched || allAttempted))
                     {
                         reflectState.GoalMet = true;
                         AddOrchestratorSystemMessage(orchestratorName, $"✅ Orchestrator completed without delegation (iteration {reflectState.CurrentIteration}).");
                         break;
+                    }
+                    if (!allDispatched && queuedAssignments.Count == 0)
+                    {
+                        // Not all workers dispatched — force dispatch remaining workers
+                        var remaining = workerNames.Where(w => !dispatchedWorkers.Contains(w) && !attemptedWorkers.Contains(w)).ToList();
+                        Debug($"[DISPATCH] Iteration {reflectState.CurrentIteration}: 0 assignments but {remaining.Count} workers never dispatched — forcing: {string.Join(", ", remaining)}");
+                        AddOrchestratorSystemMessage(orchestratorName,
+                            $"⚡ Forcing dispatch to {remaining.Count} remaining worker(s): {string.Join(", ", remaining)}");
+                        assignments = remaining.Select(w => new TaskAssignment(w, prompt)).ToList();
+                        // Fall through to dispatch below
                     }
                     // Fall through to merge and dispatch queued work
                 }
@@ -2390,6 +2483,10 @@ public partial class CopilotService
             foreach (var r in results.Where(r => r.Success))
                 dispatchedWorkers.Add(r.WorkerName);
 
+            // After early dispatch, the orchestrator may still be doing tool work.
+            // Wait for it to go idle before sending the synthesis prompt.
+            await WaitForSessionIdleAsync(orchestratorName, ct);
+
             // Phase 4: Synthesize + Evaluate
             InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Synthesizing, iterDetail));
 
@@ -2418,13 +2515,16 @@ public partial class CopilotService
                 var evaluatorModel = GetEffectiveModel(evaluatorName);
                 var trend = reflectState.RecordEvaluation(reflectState.CurrentIteration, score, rationale, evaluatorModel);
 
-                // Check if evaluator says complete — but only if all workers have participated successfully
+                // Check if evaluator says complete
+                var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
                 if ((evalResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase) || score >= 0.9)
-                    && allWorkersDispatched)
+                    && (allWorkersDispatched || allWorkersAttempted))
                 {
+                    var partial = !allWorkersDispatched && allWorkersAttempted;
                     reflectState.GoalMet = true;
                     reflectState.IsActive = false;
-                    AddOrchestratorSystemMessage(orchestratorName, $"✅ {reflectState.BuildCompletionSummary()} (score: {score:F1})");
+                    var suffix = partial ? " (some workers failed but all were attempted)" : "";
+                    AddOrchestratorSystemMessage(orchestratorName, $"✅ {reflectState.BuildCompletionSummary()} (score: {score:F1}){suffix}");
                     break;
                 }
 
@@ -2435,7 +2535,7 @@ public partial class CopilotService
                     var neverDispatched = missing.Where(w => !attemptedWorkers.Contains(w)).ToList();
                     var detail = neverDispatched.Count > 0
                         ? $"Not yet dispatched: {string.Join(", ", neverDispatched)}."
-                        : $"Dispatched but failed: {string.Join(", ", failedButAttempted)}. Retry or address errors.";
+                        : $"Dispatched but failed: {string.Join(", ", failedButAttempted)}. Will retry next iteration.";
                     Debug($"Reflection: overriding completion — {detail}");
                     reflectState.LastEvaluation = $"{detail} Dispatch to the remaining workers before completing.";
                     AddOrchestratorSystemMessage(orchestratorName, $"🔄 Overriding completion — {detail}");
@@ -2452,18 +2552,21 @@ public partial class CopilotService
             {
                 synthesisResponse = await SendPromptAndWaitAsync(orchestratorName, synthEvalPrompt, ct, originalPrompt: prompt);
 
-                // Check completion sentinel — but only if all workers have participated successfully
+                // Check completion sentinel
+                var allWorkersAttempted = workerNames.All(w => attemptedWorkers.Contains(w));
                 if (synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
-                    && allWorkersDispatched)
+                    && (allWorkersDispatched || allWorkersAttempted))
                 {
+                    var partial = !allWorkersDispatched && allWorkersAttempted;
                     reflectState.GoalMet = true;
                     reflectState.IsActive = false;
-                    AddOrchestratorSystemMessage(orchestratorName, $"✅ {reflectState.BuildCompletionSummary()}");
+                    var suffix = partial ? " (some workers failed but all were attempted)" : "";
+                    AddOrchestratorSystemMessage(orchestratorName, $"✅ {reflectState.BuildCompletionSummary()}{suffix}");
                     break;
                 }
 
                 if (synthesisResponse.Contains("[[GROUP_REFLECT_COMPLETE]]", StringComparison.OrdinalIgnoreCase)
-                    && !allWorkersDispatched)
+                    && !allWorkersAttempted)
                 {
                     // Override premature completion — not all workers have participated
                     var missing = workerNames.Where(w => !dispatchedWorkers.Contains(w)).ToList();
@@ -2559,25 +2662,16 @@ public partial class CopilotService
             reflectState.IsActive = false;
             reflectState.CompletedAt = DateTime.Now;
             ClearPendingOrchestration();
-            // Send any remaining queued prompts to the orchestrator before releasing the lock.
-            // These were acknowledged to the user ("📨 queued") but the loop is exiting —
-            // sending them ensures the model sees them rather than silently discarding.
+            // Collect leftover queued prompts synchronously for best-effort delivery
+            // AFTER releasing the semaphore. This prevents holding the semaphore forever
+            // if SendPromptAndWaitAsync blocks on a broken SDK connection (e.g., StreamJsonRpc
+            // serialization errors during cancellation). See PR #323.
             if (_reflectQueuedPrompts.TryGetValue(groupId, out var remainingQueue))
             {
                 while (remainingQueue.TryDequeue(out var leftover))
-                {
-                    try
-                    {
-                        Debug($"[DISPATCH] Sending leftover queued prompt on loop exit (len={leftover.Length})");
-                        await SendPromptAndWaitAsync(orchestratorName,
-                            $"[User sent a message — the reflection loop has completed]\n\n{leftover}", ct, originalPrompt: leftover);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug($"[DISPATCH] Failed to send leftover queued prompt: {ex.Message}");
-                    }
-                }
+                    leftoverPrompts.Add(leftover);
             }
+
             SaveOrganization();
             InvokeOnUI(() =>
             {
@@ -2590,6 +2684,31 @@ public partial class CopilotService
         finally
         {
             loopLock.Release();
+        }
+
+        // Fire-and-forget: deliver leftover prompts after semaphore is released.
+        // If delivery fails (broken connection), prompts are still visible in chat history.
+        if (leftoverPrompts.Count > 0)
+        {
+            var orchName = orchestratorName;
+            SafeFireAndForget(Task.Run(async () =>
+            {
+                foreach (var leftover in leftoverPrompts)
+                {
+                    try
+                    {
+                        Debug($"[DISPATCH] Sending leftover queued prompt after loop exit (len={leftover.Length})");
+                        using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                        await SendPromptAndWaitAsync(orchName,
+                            $"[User sent a message — the reflection loop has completed]\n\n{leftover}",
+                            cleanupCts.Token, originalPrompt: leftover);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug($"[DISPATCH] Failed to send leftover queued prompt: {ex.Message}");
+                    }
+                }
+            }), "leftover-prompt-delivery");
         }
     }
 
@@ -2654,6 +2773,7 @@ public partial class CopilotService
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("You are a DISPATCHER ONLY. You do NOT have tools. You CANNOT write code, read files, or run commands yourself.");
         sb.AppendLine("Your ONLY job is to write @worker/@end blocks that assign work to your workers.");
+        sb.AppendLine("Even if previous conversation history shows completed work, you MUST dispatch FRESH tasks now.");
         sb.AppendLine();
         sb.AppendLine("## Previous Iteration Evaluation");
         sb.AppendLine(lastEvaluation);
