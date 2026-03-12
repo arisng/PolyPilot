@@ -223,6 +223,7 @@ public partial class CopilotService
             // Real event arrived — reset the Case A reset counter. This proves the session's
             // JSON-RPC connection is alive, so future Case A resets are legitimate.
             Interlocked.Exchange(ref state.WatchdogCaseAResets, 0);
+            Interlocked.Exchange(ref state.WatchdogCaseBResets, 0);
             state.Info.LastUpdatedAt = DateTime.Now;
         }
         // Count every event for zero-idle diagnostics (#299)
@@ -382,8 +383,26 @@ public partial class CopilotService
                 var completeToolName = toolDone.Data?.GetType().GetProperty("ToolName")?.GetValue(toolDone.Data)?.ToString();
                 var resultStr = FormatToolResult(toolDone.Data!.Result);
                 var hasError = toolDone.Data.Error != null;
-                var errorStr = toolDone.Data.Error?.ToString();
-                var isPermissionDenial = IsPermissionDenialText(resultStr) || IsPermissionDenialText(errorStr);
+                // Extract the error message from the structured Error object.
+                // Error is a ToolExecutionCompleteDataError with Message/Code properties
+                // — its default ToString() returns the type name, not the message text.
+                var errorStr = ExtractErrorMessage(toolDone.Data.Error);
+                // Only check resultStr for permission text when there IS an error.
+                // Successful tool results can contain source code that mentions "Permission denied"
+                // (e.g., reading our own permission detection code) — false positive.
+                var isPermissionDenial = IsPermissionDenialText(errorStr)
+                    || (hasError && IsPermissionDenialText(resultStr));
+
+                // Black-box log every permission denial for post-mortem analysis
+                if (isPermissionDenial)
+                {
+                    var errorPreview = errorStr?.Length > 150 ? errorStr[..150] : errorStr;
+                    var resultPreview = resultStr?.Length > 150 ? resultStr[..150] : resultStr;
+                    Debug($"[PERMISSION-DENY] '{sessionName}' tool='{completeToolName}' " +
+                          $"error='{errorPreview}' result='{resultPreview}' hasError={hasError} " +
+                          $"errorType={toolDone.Data.Error?.GetType().Name} " +
+                          $"(denials={state.Info.PermissionDenialCount + 1}, isMultiAgent={state.IsMultiAgentSession})");
+                }
 
                 // Track permission denials via sliding window (3 of last 5 tool results)
                 // This handles cases where an occasional OK tool resets a strict consecutive counter
@@ -392,15 +411,21 @@ public partial class CopilotService
                     var denialCount = state.Info.RecordToolResult(isPermissionDenial);
                     if (!isPermissionDenial && !hasError)
                         Interlocked.Increment(ref state.SuccessfulToolCountThisTurn);
-                    if (isPermissionDenial && denialCount == 3)
+                    if (isPermissionDenial && denialCount >= 3)
                     {
-                        Invoke(() =>
+                        // Trigger recovery on first threshold crossing (denialCount == 3),
+                        // not on subsequent denials that stay at 3+ in the window
+                        if (denialCount == 3)
                         {
-                            state.Info.History.Add(ChatMessage.SystemMessage(
-                                "⚠️ Permission errors detected. Attempting to reconnect session..."));
-                            OnStateChanged?.Invoke();
-                            _ = TryRecoverPermissionAsync(state, sessionName);
-                        });
+                            Debug($"[PERMISSION-RECOVER-TRIGGER] '{sessionName}' threshold reached ({denialCount}/5 denials)");
+                            Invoke(() =>
+                            {
+                                state.Info.History.Add(ChatMessage.SystemMessage(
+                                    "⚠️ Permission errors detected. Attempting to reconnect session..."));
+                                OnStateChanged?.Invoke();
+                                _ = TryRecoverPermissionAsync(state, sessionName);
+                            });
+                        }
                     }
                 }
 
@@ -430,7 +455,8 @@ public partial class CopilotService
                     {
                         histToolMsg.IsComplete = true;
                         histToolMsg.IsSuccess = !hasError;
-                        histToolMsg.Content = resultStr;
+                        // If resultStr is empty but there's an error message, show the error
+                        histToolMsg.Content = string.IsNullOrEmpty(resultStr) && hasError ? errorStr ?? "" : resultStr;
                     }
                 }
 
@@ -510,26 +536,13 @@ public partial class CopilotService
                                 Debug($"[IDLE-FALLBACK] '{sessionName}' skipped — tools still active");
                                 return;
                             }
-                            // Guard: if tools were used this turn, the LLM may still be reasoning
-                            // between tool rounds (TurnEnd → thinking → TurnStart, >4s).
-                            // Don't complete immediately — wait an additional period. If no new
-                            // TurnStart arrives within that window, SessionIdleEvent was lost
-                            // (SDK bug #299) and we must complete to unblock the session.
+                            // Guard: if tools were used this turn, more agent rounds may follow
+                            // (TurnEnd → thinking → TurnStart → more tools). Firing CompleteResponse
+                            // here would prematurely end the turn. Skip the fallback entirely and
+                            // let the watchdog handle any genuinely stuck sessions.
                             if (state.HasUsedToolsThisTurn)
                             {
-                                await Task.Delay(TurnEndIdleToolFallbackAdditionalMs, fallbackToken);
-                                if (fallbackToken.IsCancellationRequested) return;
-                                // Re-check: if a new tool started or TurnStart fired and cancelled
-                                // this token, we would have exited above. If still here, no new
-                                // activity arrived → SessionIdleEvent was lost → complete.
-                                if (Volatile.Read(ref state.ActiveToolCallCount) > 0)
-                                {
-                                    Debug($"[IDLE-FALLBACK] '{sessionName}' skipped after extended wait — tools still active");
-                                    return;
-                                }
-                                Debug($"[IDLE-FALLBACK] '{sessionName}' SessionIdleEvent not received {TurnEndIdleFallbackMs + TurnEndIdleToolFallbackAdditionalMs}ms after TurnEnd (tools used) — firing CompleteResponse");
-                                CaptureZeroIdleDiagnostics(state, sessionName, toolsUsed: true);
-                                InvokeOnUI(() => CompleteResponse(state, turnEndGen));
+                                Debug($"[IDLE-FALLBACK] '{sessionName}' skipped — tools were used this turn (watchdog will handle if stuck)");
                                 return;
                             }
                             Debug($"[IDLE-FALLBACK] '{sessionName}' SessionIdleEvent not received {TurnEndIdleFallbackMs}ms after TurnEnd — firing CompleteResponse");
@@ -1468,6 +1481,14 @@ public partial class CopilotService
     /// 600s (first) + 2 × 60s (escalation) = 720s ≈ 12 minutes.</summary>
     internal const int WatchdogMaxToolAliveResets = 2;
 
+    /// <summary>Maximum number of consecutive Case B deferrals (tool finished, events.jsonl fresh)
+    /// before completing anyway. Unlike Case A (dead connection), Case B sessions are genuinely
+    /// active but ActiveToolCallCount drops to 0 between tool rounds. A generous cap allows
+    /// long-running tools (e.g., skill-validator) while preventing infinite deferrals when the
+    /// CLI finishes but SessionIdleEvent is lost. At 15s check intervals, 40 deferrals ≈ 10 min
+    /// of additional time beyond the initial 120s inactivity timeout.</summary>
+    internal const int WatchdogMaxCaseBResets = 40;
+
     /// <summary>
     /// Milliseconds after a tool starts to perform the first health check. If no events have
     /// arrived since tool start, we verify the connection is still alive. This detects dead
@@ -1664,6 +1685,37 @@ public partial class CopilotService
             || text.Contains("could not request permission", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Extracts a human-readable error message from a ToolExecutionCompleteData.Error object.
+    /// The SDK's ToolExecutionCompleteDataError type has Message/Code properties but does NOT
+    /// override ToString() — calling ToString() returns the type name, not the message.
+    /// This method reads the Message and Code properties via reflection to get the actual text.
+    /// </summary>
+    internal static string? ExtractErrorMessage(object? error)
+    {
+        if (error == null) return null;
+        try
+        {
+            // Try to read the Message property (primary error text)
+            var msgProp = error.GetType().GetProperty("Message");
+            var message = msgProp?.GetValue(error)?.ToString();
+            // Also read Code for additional context
+            var codeProp = error.GetType().GetProperty("Code");
+            var code = codeProp?.GetValue(error)?.ToString();
+            if (!string.IsNullOrEmpty(message) && !string.IsNullOrEmpty(code))
+                return $"{message} (code: {code})";
+            if (!string.IsNullOrEmpty(message))
+                return message;
+            if (!string.IsNullOrEmpty(code))
+                return code;
+        }
+        catch
+        {
+            // Reflection failed — fall through to ToString()
+        }
+        return error.ToString();
+    }
+
     private void StartProcessingWatchdog(SessionState state, string sessionName)
     {
         CancelProcessingWatchdog(state);
@@ -1673,6 +1725,7 @@ public partial class CopilotService
         // This is the exact regression pattern from PR #148 (short timeout killing active sessions).
         Interlocked.Exchange(ref state.LastEventAtTicks, DateTime.UtcNow.Ticks);
         Interlocked.Exchange(ref state.WatchdogCaseAResets, 0);
+        Interlocked.Exchange(ref state.WatchdogCaseBResets, 0);
         state.ProcessingWatchdog = new CancellationTokenSource();
         var ct = state.ProcessingWatchdog.Token;
         _ = RunProcessingWatchdogAsync(state, sessionName, ct);
@@ -1878,6 +1931,53 @@ public partial class CopilotService
                             // For multi-agent no-tool sessions: LLM finished generating, SDK dropped
                             // both AssistantTurnEndEvent and SessionIdleEvent. Server liveness check
                             // confirms the session completed normally, not a server crash.
+                            //
+                            // BUT: ActiveToolCallCount can drop to 0 between tool rounds (the model
+                            // is deciding what to do next). If events.jsonl is still being written,
+                            // the session is alive — don't complete prematurely.
+                            if (!IsDemoMode && !IsRemoteMode && startedAt.HasValue)
+                            {
+                                // Compare events.jsonl modification time to when this turn started
+                                // AND check that it was modified recently (within 5 min). The CLI
+                                // writes events.jsonl independently from our SDK handler — during
+                                // long tool execution, our handler sees zero events but the CLI may
+                                // still be writing. We need BOTH checks because:
+                                // - "after turn start" alone stays true forever once any event is written
+                                // - "recent" alone could match stale files from a previous turn
+                                var caseBEventsActive = false;
+                                try
+                                {
+                                    var sid = state.Info.SessionId;
+                                    if (!string.IsNullOrEmpty(sid))
+                                    {
+                                        var ep = Path.Combine(SessionStatePath, sid, "events.jsonl");
+                                        if (File.Exists(ep))
+                                        {
+                                            var lastWrite = File.GetLastWriteTimeUtc(ep);
+                                            var age = (DateTime.UtcNow - lastWrite).TotalSeconds;
+                                            // File must be: (1) written after this turn started AND
+                                            // (2) written within last 5 minutes (CLI is still active)
+                                            caseBEventsActive = lastWrite > startedAt.Value && age < 300;
+                                        }
+                                    }
+                                }
+                                catch { /* filesystem errors → proceed with completion */ }
+
+                                if (caseBEventsActive)
+                                {
+                                    var caseBResets = Interlocked.Increment(ref state.WatchdogCaseBResets);
+                                    if (caseBResets <= WatchdogMaxCaseBResets)
+                                    {
+                                        Debug($"[WATCHDOG] '{sessionName}' Case B deferred — events.jsonl modified since turn start, session still active " +
+                                              $"(elapsed={elapsed:F0}s, totalProcessing={totalProcessingSeconds:F0}s, deferral={caseBResets}/{WatchdogMaxCaseBResets})");
+                                        Interlocked.Exchange(ref state.LastEventAtTicks, DateTime.UtcNow.Ticks);
+                                        continue;
+                                    }
+                                    Debug($"[WATCHDOG] '{sessionName}' Case B deferral cap reached ({caseBResets}/{WatchdogMaxCaseBResets}) — completing despite fresh events.jsonl " +
+                                          $"(elapsed={elapsed:F0}s, totalProcessing={totalProcessingSeconds:F0}s)");
+                                }
+                            }
+
                             var watchdogGen = Interlocked.Read(ref state.ProcessingGeneration);
                             Debug($"[WATCHDOG] '{sessionName}' tool finished but SessionIdleEvent never arrived — completing cleanly " +
                                   $"(elapsed={elapsed:F0}s, totalProcessing={totalProcessingSeconds:F0}s)");

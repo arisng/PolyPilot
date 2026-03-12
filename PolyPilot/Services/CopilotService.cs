@@ -446,6 +446,10 @@ public partial class CopilotService : IAsyncDisposable
         /// WatchdogMaxToolAliveResets to prevent infinite resets when the session's JSON-RPC
         /// connection is dead but the shared persistent server is still alive.</summary>
         public int WatchdogCaseAResets;
+        /// <summary>Number of consecutive times Case B (tool finished, events.jsonl still fresh)
+        /// deferred completion. Capped by WatchdogMaxCaseBResets to prevent infinite deferrals
+        /// when events.jsonl was written during the turn but the CLI has actually finished.</summary>
+        public int WatchdogCaseBResets;
         /// <summary>True if the TurnEnd→Idle fallback was canceled by an AssistantTurnStartEvent.
         /// Used for diagnostic logging: when the next TurnEnd re-arms the fallback, the log shows
         /// the self-healing loop in action (TurnEnd → TurnStart cancel → TurnEnd re-arm).</summary>
@@ -486,6 +490,7 @@ public partial class CopilotService : IAsyncDisposable
             message.StartsWith("[RECONNECT") || message.StartsWith("[UI-ERR") ||
             message.StartsWith("[DISPATCH") || message.StartsWith("[WATCHDOG") ||
             message.StartsWith("[HEALTH") || message.StartsWith("[ZERO-IDLE") ||
+            message.StartsWith("[PERMISSION") ||
             message.Contains("watchdog"))
         {
             try
@@ -2659,6 +2664,10 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     CancelToolHealthCheck(state);
                     Debug($"[RECONNECT] '{sessionName}' replacing state (old handler will be orphaned, " +
                           $"old session disposed, new session={newSession.SessionId})");
+                    // Preserve accumulated response content from the old state.
+                    // FlushedResponse contains text from earlier FlushCurrentResponse calls —
+                    // this is real output the worker produced before the connection died.
+                    var preservedFlushed = state.FlushedResponse.ToString();
                     var newState = new SessionState
                     {
                         Session = newSession,
@@ -2694,7 +2703,15 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // the reconnected session inherits a stale deadline.
                     state.Info.ProcessingStartedAt = DateTime.UtcNow;
                     state.CurrentResponse.Clear();
+                    // Carry forward accumulated response from the old state so
+                    // CompleteResponse can include it in the TCS result. Without
+                    // this, reconnect loses all content flushed before the retry.
                     state.FlushedResponse.Clear();
+                    if (!string.IsNullOrEmpty(preservedFlushed))
+                    {
+                        state.FlushedResponse.Append(preservedFlushed);
+                        Debug($"[RECONNECT] '{sessionName}' preserved {preservedFlushed.Length} chars of flushed response");
+                    }
                     state.PendingReasoningMessages.Clear();
                     Debug($"[RECONNECT] '{sessionName}' reset processing state: gen={Interlocked.Read(ref state.ProcessingGeneration)}");
                     

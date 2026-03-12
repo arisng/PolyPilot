@@ -1071,70 +1071,51 @@ public partial class CopilotService
             orchPlanning.EarlyDispatchOnWorkerBlocks = true;
         var planResponse = await SendPromptAndWaitAsync(orchestratorName, planningPrompt, cancellationToken, originalPrompt: prompt);
 
-        // Phase 2: Parse task assignments from orchestrator response, with retry loop.
-        // Uses conversation history (no fresh sessions) so the model remembers what it already assigned.
+        // Phase 2: Parse task assignments from orchestrator response.
+        // If the orchestrator assigns fewer workers than available, respect that decision —
+        // not every request needs all workers (e.g., "post a comment on PR #341" only needs
+        // the worker that reviewed that PR). Only nudge when ZERO assignments (format failure).
         var allAssignments = new List<TaskAssignment>();
         var dispatchedWorkers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        const int maxDispatchIterations = 3;
 
-        for (int dispatchIter = 0; dispatchIter < maxDispatchIterations; dispatchIter++)
+        var rawAssignments = ParseTaskAssignments(planResponse, workerNames);
+        Debug($"[DISPATCH] '{orchestratorName}' iteration 0: {rawAssignments.Count} raw assignments. Response length={planResponse.Length}");
+
+        var iterAssignments = DeduplicateAssignments(rawAssignments, dispatchedWorkers);
+
+        if (iterAssignments.Count == 0)
         {
-            string responseToParse;
-            if (dispatchIter == 0)
-            {
-                // First iteration: parse the initial planning response
-                responseToParse = planResponse;
-            }
-            else
-            {
-                // Subsequent iterations: nudge with context about who's already dispatched
-                var remaining = workerNames.Where(w => !dispatchedWorkers.Contains(w)).ToList();
-                if (remaining.Count == 0) break;
-
-                var nudgeSb = new System.Text.StringBuilder();
-                nudgeSb.AppendLine($"You dispatched {dispatchedWorkers.Count} worker(s): {string.Join(", ", dispatchedWorkers)}");
-                nudgeSb.AppendLine($"{remaining.Count} worker(s) remain: {string.Join(", ", remaining)}");
-                nudgeSb.AppendLine();
-                nudgeSb.AppendLine($"Dispatch ALL {remaining.Count} remaining workers NOW. Each MUST receive a DIFFERENT sub-task.");
-                nudgeSb.AppendLine("Produce one @worker:name...@end block for EACH remaining worker in this single response.");
-                responseToParse = await SendPromptAndWaitAsync(orchestratorName, nudgeSb.ToString(), cancellationToken, originalPrompt: prompt);
-            }
-
-            var rawAssignments = ParseTaskAssignments(responseToParse, workerNames);
-            Debug($"[DISPATCH] '{orchestratorName}' iteration {dispatchIter}: {rawAssignments.Count} raw assignments. Response length={responseToParse.Length}");
-
-            // Deduplicate: merge multiple tasks for the same worker
-            var iterAssignments = DeduplicateAssignments(rawAssignments, dispatchedWorkers);
-
-            if (iterAssignments.Count == 0 && dispatchIter == 0)
-            {
-                // First pass produced nothing — send a single nudge (backwards compat)
-                Debug($"[DISPATCH] No assignments parsed. Sending delegation nudge.");
-                var nudgePrompt = BuildDelegationNudgePrompt(workerNames);
-                var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, cancellationToken, originalPrompt: prompt);
-                iterAssignments = DeduplicateAssignments(ParseTaskAssignments(nudgeResponse, workerNames), dispatchedWorkers);
-                Debug($"[DISPATCH] Nudge parsed: {iterAssignments.Count} assignments.");
-            }
+            // First pass produced nothing — send a single nudge (format failure recovery)
+            Debug($"[DISPATCH] No assignments parsed. Sending delegation nudge.");
+            var nudgePrompt = BuildDelegationNudgePrompt(workerNames);
+            var nudgeResponse = await SendPromptAndWaitAsync(orchestratorName, nudgePrompt, cancellationToken, originalPrompt: prompt);
+            iterAssignments = DeduplicateAssignments(ParseTaskAssignments(nudgeResponse, workerNames), dispatchedWorkers);
+            Debug($"[DISPATCH] Nudge parsed: {iterAssignments.Count} assignments.");
 
             if (iterAssignments.Count == 0)
             {
-                if (allAssignments.Count == 0)
+                // Still nothing after nudge — force a second nudge reminding it MUST delegate
+                Debug($"[DISPATCH] No assignments after nudge. Sending final delegation reminder.");
+                var finalNudge = "You MUST delegate this task to at least one worker using @worker:name...@end blocks. You cannot do it yourself. Pick the most relevant worker and assign the task now.";
+                var finalResponse = await SendPromptAndWaitAsync(orchestratorName, finalNudge, cancellationToken, originalPrompt: prompt);
+                iterAssignments = DeduplicateAssignments(ParseTaskAssignments(finalResponse, workerNames), dispatchedWorkers);
+                Debug($"[DISPATCH] Final nudge parsed: {iterAssignments.Count} assignments.");
+
+                if (iterAssignments.Count == 0)
                 {
-                    Debug($"[DISPATCH] No assignments after iteration {dispatchIter}. Orchestrator handled directly.");
-                    AddOrchestratorSystemMessage(orchestratorName, "ℹ️ Orchestrator handled the request directly (no tasks delegated to workers).");
+                    Debug($"[DISPATCH] No assignments after all nudges. Cannot proceed without delegation.");
+                    AddOrchestratorSystemMessage(orchestratorName, "⚠️ Failed to delegate — orchestrator did not produce any @worker assignments after multiple attempts.");
                     InvokeOnUI(() => OnOrchestratorPhaseChanged?.Invoke(groupId, OrchestratorPhase.Complete, null));
                     return;
                 }
-                break; // Have some assignments, proceed to dispatch
             }
-
-            allAssignments.AddRange(iterAssignments);
-            foreach (var a in iterAssignments)
-                dispatchedWorkers.Add(a.WorkerName);
-
-            // If all workers are assigned or this is the last iteration, stop
-            if (dispatchedWorkers.Count >= workerNames.Count) break;
         }
+
+        allAssignments.AddRange(iterAssignments);
+        foreach (var a in iterAssignments)
+            dispatchedWorkers.Add(a.WorkerName);
+
+        Debug($"[DISPATCH] Orchestrator assigned {dispatchedWorkers.Count}/{workerNames.Count} workers. Respecting partial assignment.");
 
         var assignments = allAssignments;
 
@@ -1228,7 +1209,8 @@ public partial class CopilotService
         }
         else
         {
-            sb.AppendLine("Break the request into tasks and assign them to workers. You may also do some coordination work yourself (e.g., verifying results, running commands).");
+            sb.AppendLine("You are a DISPATCHER. Break the request into tasks and assign them to workers via @worker blocks.");
+            sb.AppendLine("You MUST always delegate work to workers. Do NOT attempt to do the work yourself.");
         }
         sb.AppendLine();
         sb.AppendLine("IMPORTANT: Each worker MUST receive a DIFFERENT sub-task. Do NOT assign the same work to two workers.");
@@ -1240,10 +1222,11 @@ public partial class CopilotService
         sb.AppendLine("Detailed task description for this worker.");
         sb.AppendLine("@end");
         sb.AppendLine();
-        sb.AppendLine($"CRITICAL: Assign ALL workers that have relevant work IN THIS SINGLE RESPONSE. You have {workerNames.Count} workers — produce multiple @worker blocks now, not one at a time.");
+        sb.AppendLine($"IMPORTANT: Assign ALL workers that have relevant work IN THIS SINGLE RESPONSE — produce multiple @worker blocks now, not one at a time.");
+        sb.AppendLine("However, only assign workers that have RELEVANT work to do. If the task only needs one worker (e.g., a follow-up on a specific PR), assign just that one worker — the one with the right context.");
+        sb.AppendLine("Each worker retains conversation history from previous turns, so prefer the worker who already worked on the relevant topic.");
         sb.AppendLine("You may include brief analysis before the @worker blocks, but every response MUST contain @worker blocks for all workers you intend to use.");
-        if (dispatcherOnly)
-            sb.AppendLine("NEVER attempt to do the work yourself. ALWAYS delegate via @worker blocks.");
+        sb.AppendLine("NEVER attempt to do the work yourself. ALWAYS delegate via @worker blocks.");
         return sb.ToString();
     }
 
@@ -1351,6 +1334,65 @@ public partial class CopilotService
     private record WorkerResult(string WorkerName, string? Response, bool Success, string? Error, TimeSpan Duration);
 
     /// <summary>
+    /// Full INV-1-compliant force-completion of a session's processing state.
+    /// Clears all 9+ companion fields, resolves the ResponseCompletion TCS,
+    /// fires OnSessionComplete, and cancels background timers.
+    /// Must be awaited — runs state mutation on UI thread via TCS synchronization.
+    /// </summary>
+    private async Task ForceCompleteProcessingAsync(string sessionName, SessionState state, string reason)
+    {
+        // Cancel timers first (thread-safe — use Interlocked internally)
+        CancelProcessingWatchdog(state);
+        CancelTurnEndFallback(state);
+        CancelToolHealthCheck(state);
+
+        var tcs = new TaskCompletionSource<bool>();
+        InvokeOnUI(() =>
+        {
+            try
+            {
+                if (!state.Info.IsProcessing) { tcs.TrySetResult(true); return; }
+
+                // Full cleanup mirroring CompleteResponse / unstartedWorkers recovery
+                FlushCurrentResponse(state);
+                Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
+                Interlocked.Exchange(ref state.SendingFlag, 0);
+                Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
+                Interlocked.Exchange(ref state.WatchdogCaseAResets, 0);
+                Interlocked.Exchange(ref state.WatchdogCaseBResets, 0);
+                state.HasUsedToolsThisTurn = false;
+                state.FallbackCanceledByTurnStart = false;
+                state.Info.IsResumed = false;
+                state.Info.ProcessingStartedAt = null;
+                state.Info.ToolCallCount = 0;
+                state.Info.ProcessingPhase = 0;
+                state.Info.ClearPermissionDenials();
+
+                var response = state.CurrentResponse.ToString();
+                var fullResponse = state.FlushedResponse.Length > 0
+                    ? (string.IsNullOrEmpty(response)
+                        ? state.FlushedResponse.ToString()
+                        : state.FlushedResponse + "\n\n" + response)
+                    : response;
+
+                state.CurrentResponse.Clear();
+                state.FlushedResponse.Clear();
+                state.PendingReasoningMessages.Clear();
+                state.Info.IsProcessing = false;
+
+                state.ResponseCompletion?.TrySetResult(fullResponse);
+                var summary = fullResponse.Length > 0 ? (fullResponse.Length > 100 ? fullResponse[..100] + "..." : fullResponse) : "";
+                OnSessionComplete?.Invoke(sessionName, summary);
+                OnStateChanged?.Invoke();
+                Debug($"[DISPATCH] ForceCompleteProcessing '{sessionName}': {reason} (responseLen={fullResponse.Length})");
+                tcs.TrySetResult(true);
+            }
+            catch (Exception ex) { tcs.TrySetException(ex); }
+        });
+        try { await tcs.Task; } catch { }
+    }
+
+    /// <summary>
     /// Wait for a session to finish processing (go idle). Used after early dispatch
     /// resolves the orchestrator's TCS while it's still doing tool work — we must
     /// wait for it to go idle before sending the next prompt (synthesis).
@@ -1376,8 +1418,8 @@ public partial class CopilotService
             var secondsSinceLastEvent = (DateTime.UtcNow - new DateTime(lastEventTicks)).TotalSeconds;
             if (secondsSinceLastEvent >= inactivityThresholdSeconds)
             {
-                Debug($"[DISPATCH] '{sessionName}' no SDK events for {secondsSinceLastEvent:F0}s — aborting to proceed with synthesis");
-                await AbortSessionAsync(sessionName);
+                Debug($"[DISPATCH] '{sessionName}' no SDK events for {secondsSinceLastEvent:F0}s — force-completing to proceed with synthesis");
+                await ForceCompleteProcessingAsync(sessionName, state, $"inactivity {secondsSinceLastEvent:F0}s");
                 await Task.Delay(500, ct);
                 break;
             }
@@ -1385,8 +1427,8 @@ public partial class CopilotService
         }
         if (state.Info.IsProcessing)
         {
-            Debug($"[DISPATCH] '{sessionName}' still processing after {sw.Elapsed.TotalSeconds:F1}s — aborting to allow synthesis");
-            await AbortSessionAsync(sessionName);
+            Debug($"[DISPATCH] '{sessionName}' still processing after {sw.Elapsed.TotalSeconds:F1}s — force-completing to allow synthesis");
+            await ForceCompleteProcessingAsync(sessionName, state, $"timeout {sw.Elapsed.TotalSeconds:F1}s");
             await Task.Delay(500, ct);
         }
         Debug($"[DISPATCH] '{sessionName}' now idle after {sw.Elapsed.TotalSeconds:F1}s");
@@ -1424,6 +1466,30 @@ public partial class CopilotService
 
         const int maxRetries = 2;
         var dispatchTime = DateTime.UtcNow;
+
+        // Pre-dispatch: if worker is still processing from a previous run (e.g., restored
+        // mid-processing after app relaunch), wait for it to become idle. The watchdog will
+        // clear IsProcessing within 30-120s for restored sessions.
+        if (_sessions.TryGetValue(workerName, out var preState) && preState.Info.IsProcessing)
+        {
+            Debug($"[DISPATCH] Worker '{workerName}' is still processing from previous run — waiting up to 150s");
+            var waitStart = DateTime.UtcNow;
+            while (preState.Info.IsProcessing && (DateTime.UtcNow - waitStart).TotalSeconds < 150)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(2000, cancellationToken);
+            }
+            if (preState.Info.IsProcessing)
+            {
+                Debug($"[DISPATCH] Worker '{workerName}' still processing after 150s wait — force-completing");
+                await ForceCompleteProcessingAsync(workerName, preState, "pre-dispatch 150s timeout");
+            }
+            else
+            {
+                Debug($"[DISPATCH] Worker '{workerName}' became idle after {(DateTime.UtcNow - waitStart).TotalSeconds:F1}s — proceeding with dispatch");
+            }
+        }
+
         for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
             try
@@ -1460,13 +1526,84 @@ public partial class CopilotService
                 // even though FlushedResponse/CurrentResponse were empty (e.g., watchdog completion).
                 if (string.IsNullOrWhiteSpace(response) && _sessions.TryGetValue(workerName, out var histState))
                 {
-                    var lastAssistant = histState.Info.History.ToArray()
+                    ChatMessage[] historySnapshot;
+                    try { historySnapshot = histState.Info.History.ToArray(); }
+                    catch (InvalidOperationException) { historySnapshot = Array.Empty<ChatMessage>(); }
+
+                    // First try: last assistant text message after dispatch
+                    var lastAssistant = historySnapshot
                         .LastOrDefault(m => m.Role == "assistant" && !string.IsNullOrWhiteSpace(m.Content)
+                            && m.MessageType == ChatMessageType.Assistant
                             && m.Timestamp >= dispatchTime);
                     if (lastAssistant != null)
                     {
                         response = lastAssistant.Content;
-                        Debug($"[DISPATCH] Worker '{workerName}' recovered {response!.Length} chars from chat history");
+                        Debug($"[DISPATCH] Worker '{workerName}' recovered {response!.Length} chars from chat history (assistant message)");
+                    }
+                    else
+                    {
+                        // Second try: reconstruct from tool outputs. When the agent runs a long
+                        // tool (e.g., skill-validator) and the session completes before the agent
+                        // writes its verdict, the tool results are in ToolCall messages but no
+                        // assistant text message exists.
+                        var toolOutputs = historySnapshot
+                            .Where(m => m.MessageType == ChatMessageType.ToolCall
+                                && m.IsComplete && !string.IsNullOrWhiteSpace(m.Content)
+                                && m.Timestamp >= dispatchTime)
+                            .ToList();
+                        if (toolOutputs.Count > 0)
+                        {
+                            var sb = new System.Text.StringBuilder();
+                            sb.AppendLine("## Tool Execution Results (agent did not produce a final summary)");
+                            foreach (var tool in toolOutputs)
+                            {
+                                sb.AppendLine($"### {tool.ToolName ?? "tool"}");
+                                // Truncate very large tool outputs to keep synthesis manageable
+                                var content = tool.Content!.Length > 8000 ? tool.Content[..8000] + "\n... (truncated)" : tool.Content;
+                                sb.AppendLine(content);
+                                sb.AppendLine();
+                            }
+                            response = sb.ToString();
+                            Debug($"[DISPATCH] Worker '{workerName}' recovered {response.Length} chars from {toolOutputs.Count} tool output(s)");
+                        }
+                    }
+
+                    // Third try: dead event stream recovery. When the SDK event callback stops
+                    // firing (common after session revival), History is empty but events.jsonl
+                    // has the full response written by the server process. Parse it directly.
+                    if (string.IsNullOrWhiteSpace(response))
+                    {
+                        var sessionId = histState.Info.SessionId;
+                        if (!string.IsNullOrEmpty(sessionId))
+                        {
+                            try
+                            {
+                                var diskHistory = LoadHistoryFromDisk(sessionId);
+                                var lastDiskAssistant = diskHistory
+                                    .LastOrDefault(m => m.Role == "assistant" && !string.IsNullOrWhiteSpace(m.Content)
+                                        && m.MessageType == ChatMessageType.Assistant);
+                                if (lastDiskAssistant != null)
+                                {
+                                    response = lastDiskAssistant.Content;
+                                    Debug($"[DISPATCH] Worker '{workerName}' recovered {response!.Length} chars from events.jsonl (dead event stream fallback)");
+
+                                    // Also backfill the in-memory history so it's visible in the UI
+                                    if (histState.Info.History.Count == 0)
+                                    {
+                                        InvokeOnUI(() =>
+                                        {
+                                            histState.Info.History.AddRange(diskHistory);
+                                            histState.Info.MessageCount = histState.Info.History.Count;
+                                            OnStateChanged?.Invoke();
+                                        });
+                                    }
+                                }
+                            }
+                            catch (Exception diskEx)
+                            {
+                                Debug($"[DISPATCH] Worker '{workerName}' events.jsonl fallback failed: {diskEx.Message}");
+                            }
+                        }
                     }
                 }
 
@@ -1705,17 +1842,48 @@ public partial class CopilotService
                 results.Add(new WorkerResult(workerName, lastAssistant.Content, true, null,
                     TimeSpan.FromSeconds((DateTime.UtcNow - pending.StartedAt).TotalSeconds)));
             }
-            else if (session.IsProcessing)
-            {
-                results.Add(new WorkerResult(workerName, null, false, "Still processing (timed out)", TimeSpan.Zero));
-            }
             else
             {
-                // Worker is idle with no response after dispatch — likely never started
-                // (e.g., TaskCanceledException killed the dispatch before the worker ran).
-                // Track these so we can re-dispatch them.
-                unstartedWorkers.Add(workerName);
-                results.Add(new WorkerResult(workerName, null, false, "No response found after restart", TimeSpan.Zero));
+                // Dead event stream fallback: in-memory history may be empty if the SDK event
+                // callback stopped firing. Try reading events.jsonl directly from disk.
+                string? diskResponse = null;
+                if (!session.IsProcessing)
+                {
+                    try
+                    {
+                        var diskHistory = LoadHistoryFromDisk(session.SessionId);
+                        var lastDiskAssistant = diskHistory
+                            .LastOrDefault(m => m.Role == "assistant" && !string.IsNullOrWhiteSpace(m.Content)
+                                && m.MessageType == ChatMessageType.Assistant);
+                        if (lastDiskAssistant != null)
+                        {
+                            diskResponse = lastDiskAssistant.Content;
+                            Debug($"[DISPATCH] Worker '{workerName}' recovered {diskResponse!.Length} chars from events.jsonl (resume fallback)");
+                        }
+                    }
+                    catch (Exception diskEx)
+                    {
+                        Debug($"[DISPATCH] Worker '{workerName}' events.jsonl resume fallback failed: {diskEx.Message}");
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(diskResponse))
+                {
+                    results.Add(new WorkerResult(workerName, diskResponse, true, null,
+                        TimeSpan.FromSeconds((DateTime.UtcNow - pending.StartedAt).TotalSeconds)));
+                }
+                else if (session.IsProcessing)
+                {
+                    results.Add(new WorkerResult(workerName, null, false, "Still processing (timed out)", TimeSpan.Zero));
+                }
+                else
+                {
+                    // Worker is idle with no response after dispatch — likely never started
+                    // (e.g., TaskCanceledException killed the dispatch before the worker ran).
+                    // Track these so we can re-dispatch them.
+                    unstartedWorkers.Add(workerName);
+                    results.Add(new WorkerResult(workerName, null, false, "No response found after restart", TimeSpan.Zero));
+                }
             }
         }
 
@@ -1740,56 +1908,7 @@ public partial class CopilotService
                 if (_sessions.TryGetValue(workerName, out var workerState) && workerState.Info.IsProcessing)
                 {
                     Debug($"[DISPATCH] Clearing stuck IsProcessing on '{workerName}' before re-dispatch");
-                    // Cancel timers first (thread-safe — use Interlocked internally)
-                    CancelProcessingWatchdog(workerState);
-                    CancelTurnEndFallback(workerState);
-                    CancelToolHealthCheck(workerState);
-
-                    // Must run on UI thread per INV-2; use TCS to synchronize
-                    var tcs = new TaskCompletionSource<bool>();
-                    InvokeOnUI(() =>
-                    {
-                        try
-                        {
-                            if (!workerState.Info.IsProcessing) { tcs.TrySetResult(true); return; }
-
-                            // Full cleanup mirroring CompleteResponse / tool-health recovery
-                            Interlocked.Exchange(ref workerState.ActiveToolCallCount, 0);
-                            Interlocked.Exchange(ref workerState.SendingFlag, 0);
-                            Interlocked.Exchange(ref workerState.SuccessfulToolCountThisTurn, 0);
-                            Interlocked.Exchange(ref workerState.WatchdogCaseAResets, 0);
-                            workerState.HasUsedToolsThisTurn = false;
-                            workerState.FallbackCanceledByTurnStart = false;
-                            workerState.Info.IsResumed = false;
-                            workerState.Info.ProcessingStartedAt = null;
-                            workerState.Info.ToolCallCount = 0;
-                            workerState.Info.ProcessingPhase = 0;
-                            workerState.Info.ClearPermissionDenials();
-
-                            var response = workerState.CurrentResponse.ToString();
-                            var fullResponse = workerState.FlushedResponse.Length > 0
-                                ? (string.IsNullOrEmpty(response)
-                                    ? workerState.FlushedResponse.ToString()
-                                    : workerState.FlushedResponse + "\n\n" + response)
-                                : response;
-
-                            workerState.CurrentResponse.Clear();
-                            workerState.FlushedResponse.Clear();
-                            workerState.PendingReasoningMessages.Clear();
-                            workerState.Info.IsProcessing = false;
-
-                            workerState.ResponseCompletion?.TrySetResult(fullResponse);
-                            var summary = fullResponse.Length > 0 ? (fullResponse.Length > 100 ? fullResponse[..100] + "..." : fullResponse) : "";
-                            OnSessionComplete?.Invoke(workerName, summary);
-                            OnStateChanged?.Invoke();
-                            tcs.TrySetResult(true);
-                        }
-                        catch (Exception ex)
-                        {
-                            tcs.TrySetException(ex);
-                        }
-                    });
-                    await tcs.Task;
+                    await ForceCompleteProcessingAsync(workerName, workerState, "pre-redispatch cleanup");
                 }
             }
 
@@ -1856,6 +1975,11 @@ public partial class CopilotService
         try
         {
             var synthesisPrompt = BuildSynthesisPrompt(pending.OriginalPrompt, results);
+
+            // Wait for orchestrator to go idle if it's still processing (e.g., planning phase
+            // response still streaming when workers complete and we try to send synthesis).
+            await WaitForSessionIdleAsync(pending.OrchestratorName, ct);
+
             await SendPromptAsync(pending.OrchestratorName, synthesisPrompt, cancellationToken: ct, originalPrompt: pending.OriginalPrompt);
             Debug($"[DISPATCH] Resume synthesis sent to '{pending.OrchestratorName}'");
         }
