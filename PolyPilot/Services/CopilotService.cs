@@ -2719,6 +2719,13 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // 120s watchdog tier instead of the inflated 600s from stale tool state.
                     state.HasUsedToolsThisTurn = false;
 
+                    // Schedule persistence of the new session ID so it survives app restart.
+                    // Without this, the debounced save captures the pre-reconnect snapshot
+                    // and the stale session ID is written to active-sessions.json.
+                    // Note: This is debounced (2s). If the app crashes within that window,
+                    // the fallback path in RestorePreviousSessionsAsync handles it gracefully.
+                    SaveActiveSessionsToDisk();
+
                     // Start fresh watchdog for the new connection
                     StartProcessingWatchdog(state, sessionName);
                     
