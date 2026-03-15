@@ -70,8 +70,9 @@ public class ConnectionSettings
     public bool AutoStartServer { get; set; } = false;
     public string? RemoteUrl { get; set; }
 
-    // Secrets: stored in SecureStorage on iOS/Android/MacCatalyst; plain JSON on other desktop.
-#if IOS || ANDROID || MACCATALYST
+    // Secrets: stored in SecureStorage on iOS/Android; plain JSON on desktop (incl. Mac Catalyst).
+    // Mac Catalyst runs without app sandbox, making Keychain unreliable for SecureStorage.
+#if IOS || ANDROID
     private string? _remoteToken;
     [System.Text.Json.Serialization.JsonIgnore]
     public string? RemoteToken
@@ -215,7 +216,11 @@ public class ConnectionSettings
         if (settings.Theme == UiTheme.InternationalWomensDay)
             settings.Theme = UiTheme.System;
 
-#if IOS || ANDROID || MACCATALYST
+#if MACCATALYST
+        // Reverse migration: PR 341 moved secrets to SecureStorage on Mac Catalyst,
+        // but Keychain is unreliable without app sandboxing. Recover secrets to plain JSON.
+        RecoverSecretsFromSecureStorage(settings);
+#elif IOS || ANDROID
         settings.MigrateAndLoadMobileSecrets(rawJson);
 #endif
 
@@ -260,7 +265,7 @@ public class ConnectionSettings
         {
             var dir = Path.GetDirectoryName(SettingsPath)!;
             Directory.CreateDirectory(dir);
-#if IOS || ANDROID || MACCATALYST
+#if IOS || ANDROID
             SaveMobileSecretsIfDirty();
             var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
 #else
@@ -271,7 +276,65 @@ public class ConnectionSettings
         catch { }
     }
 
-#if IOS || ANDROID || MACCATALYST
+#if MACCATALYST
+    /// <summary>
+    /// One-time reverse migration: PR 341 moved ServerPassword/RemoteToken/LanToken to
+    /// SecureStorage on Mac Catalyst. Since Mac Catalyst runs without sandbox, Keychain
+    /// is unreliable. This recovers any values and writes them back to plain JSON.
+    /// Only removes each Keychain entry after confirming that specific value was recovered.
+    /// </summary>
+    private static void RecoverSecretsFromSecureStorage(ConnectionSettings settings)
+    {
+        try
+        {
+            bool needsSave = false;
+            bool recoveredRemote = false, recoveredLan = false, recoveredPass = false;
+
+            if (string.IsNullOrEmpty(settings.RemoteToken))
+            {
+                var val = ReadSecureStorage("polypilot.connection.remoteToken");
+                if (!string.IsNullOrEmpty(val)) { settings.RemoteToken = val; needsSave = true; recoveredRemote = true; }
+            }
+            if (string.IsNullOrEmpty(settings.LanToken))
+            {
+                var val = ReadSecureStorage("polypilot.connection.lanToken");
+                if (!string.IsNullOrEmpty(val)) { settings.LanToken = val; needsSave = true; recoveredLan = true; }
+            }
+            if (string.IsNullOrEmpty(settings.ServerPassword))
+            {
+                var val = ReadSecureStorage("polypilot.connection.serverPassword");
+                if (!string.IsNullOrEmpty(val)) { settings.ServerPassword = val; needsSave = true; recoveredPass = true; }
+            }
+
+            if (needsSave)
+            {
+                settings.Save();
+
+                // Per-key cleanup: only remove a Keychain entry if that specific value was recovered
+                // and Save() wrote the file. Prevents data loss if Keychain read fails transiently
+                // for one secret but succeeds for another.
+                if (File.Exists(SettingsPath))
+                {
+                    if (recoveredRemote)
+                        try { SecureStorage.Default.Remove("polypilot.connection.remoteToken"); } catch { }
+                    if (recoveredLan)
+                        try { SecureStorage.Default.Remove("polypilot.connection.lanToken"); } catch { }
+                    if (recoveredPass)
+                        try { SecureStorage.Default.Remove("polypilot.connection.serverPassword"); } catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private static string? ReadSecureStorage(string key)
+    {
+        try { return Task.Run(() => SecureStorage.Default.GetAsync(key)).GetAwaiter().GetResult(); }
+        catch { return null; }
+    }
+#endif
+
+#if IOS || ANDROID
     private const string RemoteTokenKey = "polypilot.connection.remoteToken";
     private const string LanTokenKey = "polypilot.connection.lanToken";
     private const string ServerPasswordKey = "polypilot.connection.serverPassword";
