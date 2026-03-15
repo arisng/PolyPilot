@@ -991,18 +991,44 @@ public class WsBridgeIntegrationTests : IDisposable
     // ========== AUTH TOKEN (LOOPBACK BYPASS) ==========
 
     [Fact]
-    public async Task Connect_WithAccessTokenSet_LoopbackBypassWorks()
+    public async Task Connect_WithAccessTokenSet_NoToken_LoopbackIsRejected()
     {
         _server.AccessToken = "test-secret-token-12345";
-        await InitDemoMode();
+        try
+        {
+            await InitDemoMode();
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        // Connect without providing the token — should still work via loopback bypass
-        var client = await ConnectClientAsync(cts.Token);
-        Assert.True(client.IsConnected);
-        client.Stop();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            // Connect without providing the token — loopback no longer bypasses auth when token is configured
+            var ex = await Assert.ThrowsAnyAsync<Exception>(() => ConnectClientAsync(cts.Token));
+            Assert.True(
+                ex is System.Net.WebSockets.WebSocketException || ex is HttpRequestException || ex is InvalidOperationException || ex is OperationCanceledException,
+                $"Expected WebSocket/HTTP/timeout rejection but got {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            _server.AccessToken = null;
+        }
+    }
 
-        _server.AccessToken = null;
+    [Fact]
+    public async Task Connect_WithAccessTokenSet_CorrectToken_Works()
+    {
+        _server.AccessToken = "test-secret-token-12345";
+        try
+        {
+            await InitDemoMode();
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var client = new WsBridgeClient();
+            await client.ConnectAsync($"ws://localhost:{_port}/", "test-secret-token-12345", cts.Token);
+            Assert.True(client.IsConnected);
+            client.Stop();
+        }
+        finally
+        {
+            _server.AccessToken = null;
+        }
     }
 
     // ========== SWITCH SESSION BROADCAST ==========
