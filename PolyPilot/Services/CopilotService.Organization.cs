@@ -47,6 +47,13 @@ public partial class CopilotService
     /// the worker is likely still active despite the premature session.idle.</summary>
     internal const int PrematureIdleEventsFileFreshnessSeconds = 15;
 
+    /// <summary>Grace period after TCS completion before declaring premature idle based on
+    /// events.jsonl mtime. During this window we observe whether the file's mtime changes
+    /// (indicating the CLI is still writing), vs. remaining frozen (normal completion where
+    /// the idle event itself wrote the file). This prevents false-positive premature idle
+    /// detection when events.jsonl was just written by the completing idle event.</summary>
+    internal const int PrematureIdleEventsGracePeriodMs = 2000;
+
     /// <summary>Maximum time to wait for the worker's real completion after detecting a
     /// premature session.idle re-arm. Workers with long tool runs can take minutes.</summary>
     internal const int PrematureIdleRecoveryTimeoutMs = 300_000;
@@ -663,11 +670,18 @@ public partial class CopilotService
                     {
                         if (meta.WorktreeId == null) continue;
                         var wt = _repoManager.Worktrees.FirstOrDefault(w => w.Id == meta.WorktreeId);
-                        if (wt != null && !wt.Path.StartsWith(normalizedExtPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                            && !string.Equals(wt.Path, normalizedExtPath, StringComparison.OrdinalIgnoreCase))
+                        if (wt != null)
                         {
-                            Debug($"ReconcileOrganization: migrating '{meta.SessionName}' from promoted local folder group to URL group '{urlGroup.Id}'");
-                            meta.GroupId = urlGroup.Id;
+                            // Normalize wt.Path before comparing: on Windows, stored paths may use
+                            // forward slashes or relative forms that differ from the GetFullPath result.
+                            var normalizedWtPath = Path.GetFullPath(wt.Path)
+                                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                            if (!normalizedWtPath.StartsWith(normalizedExtPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                                && !string.Equals(normalizedWtPath, normalizedExtPath, StringComparison.OrdinalIgnoreCase))
+                            {
+                                Debug($"ReconcileOrganization: migrating '{meta.SessionName}' from promoted local folder group to URL group '{urlGroup.Id}'");
+                                meta.GroupId = urlGroup.Id;
+                            }
                         }
                     }
                 }
@@ -686,16 +700,23 @@ public partial class CopilotService
                 if (meta.WorktreeId == null) continue;
                 if (protectedGroupIds.Contains(meta.GroupId)) continue;
                 var wt = _repoManager.Worktrees.FirstOrDefault(w => w.Id == meta.WorktreeId);
-                if (wt != null && !wt.Path.StartsWith(normalizedLocalPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(wt.Path, normalizedLocalPath, StringComparison.OrdinalIgnoreCase))
+                if (wt != null)
                 {
-                    var repoName = _repoManager.Repositories.FirstOrDefault(r => r.Id == localGroup.RepoId)?.Name ?? localGroup.RepoId;
-                    var urlGroup = GetOrCreateRepoGroup(localGroup.RepoId!, repoName!);
-                    if (urlGroup != null)
+                    // Normalize wt.Path before comparing: on Windows, stored paths may use
+                    // forward slashes or relative forms that differ from the GetFullPath result.
+                    var normalizedWtPath = Path.GetFullPath(wt.Path)
+                        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    if (!normalizedWtPath.StartsWith(normalizedLocalPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(normalizedWtPath, normalizedLocalPath, StringComparison.OrdinalIgnoreCase))
                     {
-                        Debug($"ReconcileOrganization: healing '{meta.SessionName}' from local folder group '{localGroup.Name}' to URL group '{urlGroup.Id}'");
-                        meta.GroupId = urlGroup.Id;
-                        changed = true;
+                        var repoName = _repoManager.Repositories.FirstOrDefault(r => r.Id == localGroup.RepoId)?.Name ?? localGroup.RepoId;
+                        var urlGroup = GetOrCreateRepoGroup(localGroup.RepoId!, repoName!);
+                        if (urlGroup != null)
+                        {
+                            Debug($"ReconcileOrganization: healing '{meta.SessionName}' from local folder group '{localGroup.Name}' to URL group '{urlGroup.Id}'");
+                            meta.GroupId = urlGroup.Id;
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -2377,17 +2398,26 @@ public partial class CopilotService
 
         // Fast path: check if PrematureIdleSignal was already set
         var detected = IsPrematureIdleSignalSet();
-        
+
+        // Stable mtime after grace period — used as baseline for polling loop comparison
+        DateTime? stableMtime = null;
+
         if (!detected)
         {
-            // Check events.jsonl freshness immediately — if the file was just written,
-            // the CLI is still actively working despite the premature session.idle
-            detected = IsEventsFileActive(state.Info.SessionId);
+            // Snapshot mtime and wait briefly to detect whether CLI is still writing.
+            // Without this grace period we'd false-positive: the idle event itself just
+            // wrote to events.jsonl, making it appear "fresh" even on normal completion.
+            var mtimeBefore = GetEventsFileMtime(state.Info.SessionId);
+            try { await Task.Delay(PrematureIdleEventsGracePeriodMs, cancellationToken); }
+            catch (OperationCanceledException) { return initialResponse; }
+            stableMtime = GetEventsFileMtime(state.Info.SessionId);
+            // Mtime changed → CLI wrote new events during grace period → genuine premature idle
+            detected = stableMtime.HasValue && stableMtime.Value > (mtimeBefore ?? DateTime.MinValue);
         }
-        
+
         if (!detected)
         {
-            // Wait for PrematureIdleSignal OR poll events.jsonl freshness
+            // Wait for PrematureIdleSignal OR poll events.jsonl for mtime changes
             var detectStart = DateTime.UtcNow;
             while ((DateTime.UtcNow - detectStart).TotalMilliseconds < PrematureIdleDetectionWindowMs)
             {
@@ -2401,8 +2431,9 @@ public partial class CopilotService
                     break;
                 }
                 
-                // Re-check events.jsonl freshness each cycle
-                if (IsEventsFileActive(state.Info.SessionId))
+                // Check if events.jsonl mtime advanced past the stable baseline
+                var currentMtime = GetEventsFileMtime(state.Info.SessionId);
+                if (currentMtime.HasValue && currentMtime.Value > (stableMtime ?? DateTime.MinValue))
                 {
                     detected = true;
                     break;
@@ -2553,6 +2584,21 @@ public partial class CopilotService
             return fileAge < PrematureIdleEventsFileFreshnessSeconds;
         }
         catch { return false; }
+    }
+
+    /// <summary>Get the last-write UTC time of a session's events.jsonl, or null if the file
+    /// does not exist. Used by premature idle recovery to compare mtime before and after a
+    /// grace period to distinguish genuine ongoing CLI activity from a stale idle-event write.</summary>
+    internal DateTime? GetEventsFileMtime(string? sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return null;
+        try
+        {
+            var eventsPath = Path.Combine(SessionStatePath, sessionId, "events.jsonl");
+            if (!File.Exists(eventsPath)) return null;
+            return File.GetLastWriteTimeUtc(eventsPath);
+        }
+        catch { return null; }
     }
 
     private static string BuildWorkerPrompt(string identity, string worktreeNote, string sharedPrefix, string originalPrompt, string task)
