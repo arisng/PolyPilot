@@ -659,22 +659,27 @@ public partial class CopilotService : IAsyncDisposable
         }
     }
 
+    internal static bool ShouldPersistDiagnostic(string message)
+    {
+        return message.StartsWith("[EVT") || message.StartsWith("[IDLE") ||
+            message.StartsWith("[COMPLETE") || message.StartsWith("[SEND") ||
+            message.StartsWith("[RECONNECT") || message.StartsWith("[UI-ERR") ||
+            message.StartsWith("[DISPATCH") || message.StartsWith("[WATCHDOG") ||
+            message.StartsWith("[HEALTH") || message.StartsWith("[ZERO-IDLE") ||
+            message.StartsWith("[PERMISSION") || message.StartsWith("[RESUME-ABORT") ||
+            message.StartsWith("[KEEPALIVE") || message.StartsWith("[ERROR") ||
+            message.StartsWith("[ABORT") || message.StartsWith("[BRIDGE") ||
+            message.Contains("watchdog") || message.Contains("Failed to");
+    }
+
     private void Debug(string message)
     {
         LastDebugMessage = message;
         Console.WriteLine($"[DEBUG] {message}");
         OnDebug?.Invoke(message);
 
-        // Persist lifecycle diagnostics to file for post-mortem analysis (DEBUG builds only)
-#if DEBUG
-        if (message.StartsWith("[EVT") || message.StartsWith("[IDLE") ||
-            message.StartsWith("[COMPLETE") || message.StartsWith("[SEND") ||
-            message.StartsWith("[RECONNECT") || message.StartsWith("[UI-ERR") ||
-            message.StartsWith("[DISPATCH") || message.StartsWith("[WATCHDOG") ||
-            message.StartsWith("[HEALTH") || message.StartsWith("[ZERO-IDLE") ||
-            message.StartsWith("[PERMISSION") || message.StartsWith("[RESUME-ABORT") ||
-            message.StartsWith("[KEEPALIVE") ||
-            message.Contains("watchdog"))
+        // Persist lifecycle diagnostics to file for post-mortem analysis
+        if (ShouldPersistDiagnostic(message))
         {
             try
             {
@@ -691,7 +696,6 @@ public partial class CopilotService : IAsyncDisposable
             }
             catch { /* Don't let logging failures cascade */ }
         }
-#endif
     }
 
     internal void InvokeOnUI(Action action)
@@ -1407,16 +1411,32 @@ public partial class CopilotService : IAsyncDisposable
         if (bundledPath != null && File.Exists(bundledPath))
             return bundledPath;
 
+        var binaryName = OperatingSystem.IsWindows() ? "copilot.exe" : "copilot";
+
         // 2. MonoBundle/copilot (MAUI flattens runtimes/ into MonoBundle on Mac Catalyst)
         try
         {
             var assemblyDir = Path.GetDirectoryName(typeof(CopilotClient).Assembly.Location);
             if (assemblyDir != null)
             {
-                var binaryName = OperatingSystem.IsWindows() ? "copilot.exe" : "copilot";
                 var monoBundlePath = Path.Combine(assemblyDir, binaryName);
                 if (File.Exists(monoBundlePath))
                     return monoBundlePath;
+            }
+        }
+        catch { }
+
+        // 3. AppContext.BaseDirectory fallback — in Release/AOT builds, Assembly.Location
+        //    resolves to .xamarin/{arch}/ subdirectory, but the copilot binary is in the
+        //    MonoBundle root. AppContext.BaseDirectory always points to MonoBundle/.
+        try
+        {
+            var baseDir = AppContext.BaseDirectory;
+            if (!string.IsNullOrEmpty(baseDir))
+            {
+                var baseDirPath = Path.Combine(baseDir, binaryName);
+                if (File.Exists(baseDirPath))
+                    return baseDirPath;
             }
         }
         catch { }
