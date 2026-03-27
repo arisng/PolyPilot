@@ -664,9 +664,26 @@
                     if (!el.__scrollInit) {
                         el.__scrollInit = true;
                         el.__wasAtBottom = true;
+                        el.__userScrolledUp = false;
                         el.scrollTop = el.scrollHeight;
+                        // Track user-initiated scroll to suppress auto-scroll
+                        el.addEventListener('scroll', function() {
+                            if (el.__programmaticScroll) return;
+                            var dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+                            if (dist > 150) {
+                                el.__userScrolledUp = true;
+                                el.__wasAtBottom = false;
+                            } else if (dist < 50) {
+                                el.__userScrolledUp = false;
+                                el.__wasAtBottom = true;
+                            }
+                        }, { passive: true });
                         return;
                     }
+                    
+                    // If user has manually scrolled up, don't auto-scroll
+                    if (el.__userScrolledUp && !forceScroll) return;
+                    
                     var threshold = 300;
                     var distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
                     var isNearBottom = distFromBottom < threshold;
@@ -679,7 +696,13 @@
                     }
                     
                     if (forceScroll || isNearBottom || el.__wasAtBottom) {
+                        if (forceScroll) {
+                            el.__userScrolledUp = false;
+                            el.__wasAtBottom = true;
+                        }
+                        el.__programmaticScroll = true;
                         el.scrollTop = el.scrollHeight;
+                        requestAnimationFrame(function() { el.__programmaticScroll = false; });
                     }
                 });
                 // Grid cards: restore saved position or init to bottom on first render
@@ -1360,6 +1383,37 @@
                 }
             });
         });
+
+        // Position a session context menu (position:fixed) relative to its trigger button.
+        // Called from SessionListItem.razor after the menu is rendered.
+        window.positionSessionMenu = function(buttonEl) {
+            var menu = buttonEl.closest('.session-list-item, .session-list-item-wrapper, [b-sessionlistitem]')?.querySelector('.session-menu');
+            if (!menu) menu = buttonEl.parentElement?.querySelector('.session-menu');
+            if (!menu) return;
+            var r = buttonEl.getBoundingClientRect();
+            // Cap menu height to viewport with scrolling
+            var maxH = window.innerHeight - 8;
+            menu.style.maxHeight = maxH + 'px';
+            menu.style.overflowY = 'auto';
+            var mw = menu.offsetWidth, mh = Math.min(menu.scrollHeight, maxH);
+            var top = r.bottom + mh > window.innerHeight ? r.top - mh : r.bottom;
+            top = Math.max(4, Math.min(top, window.innerHeight - mh - 4));
+            // Try right-aligning to button; if that goes off-screen left, left-align instead
+            var left = r.right - mw;
+            if (left < 4) left = Math.max(4, r.left);
+            if (left + mw > window.innerWidth) left = window.innerWidth - mw - 4;
+            menu.style.top = top + 'px';
+            menu.style.left = left + 'px';
+            // Close menu if sidebar scrolls (fixed-position menu would drift)
+            var scrollParent = buttonEl.closest('.session-list');
+            if (scrollParent && !scrollParent.__menuScrollHandler) {
+                scrollParent.__menuScrollHandler = function() {
+                    var overlay = document.querySelector('.menu-overlay');
+                    if (overlay) overlay.click();
+                };
+                scrollParent.addEventListener('scroll', scrollParent.__menuScrollHandler, { passive: true });
+            }
+        };
     </script>
 
 </body>

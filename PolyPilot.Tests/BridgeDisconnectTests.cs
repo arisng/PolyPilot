@@ -132,4 +132,137 @@ public class BridgeDisconnectTests
         var svc = CreateRemoteService();
         Assert.True(svc.IsRemoteMode);
     }
+
+    [Fact]
+    public async Task ForceSync_WhenStreamingGuardActive_AppliesServerHistoryIfLarger()
+    {
+        var svc = CreateRemoteService();
+        await AddRemoteSession(svc, "test-session");
+
+        // Add 2 local messages (simulating incremental streaming)
+        var session = svc.GetSession("test-session");
+        Assert.NotNull(session);
+        session!.History.Add(ChatMessage.UserMessage("msg1"));
+        session.History.Add(ChatMessage.AssistantMessage("reply1"));
+        session.MessageCount = 2;
+
+        // Activate streaming guard (session is "mid-stream")
+        svc.SetRemoteStreamingGuardForTesting("test-session", true);
+        Assert.True(svc.IsRemoteStreamingGuardActive("test-session"));
+
+        // Server has 4 messages (more than local 2 — missed during disconnect)
+        var serverHistory = new List<ChatMessage>
+        {
+            ChatMessage.UserMessage("msg1"),
+            ChatMessage.AssistantMessage("reply1"),
+            ChatMessage.UserMessage("msg2"),
+            ChatMessage.AssistantMessage("reply2")
+        };
+        _bridgeClient.SessionHistories["test-session"] = serverHistory;
+
+        var result = await svc.ForceRefreshRemoteAsync("test-session");
+
+        Assert.True(result.Success);
+        Assert.Equal(4, session.History.Count);
+        Assert.Equal(4, session.MessageCount);
+        Assert.Equal("msg2", session.History[2].Content);
+    }
+
+    [Fact]
+    public async Task ForceSync_WhenStreamingGuardActive_SkipsIfServerHasFewerMessages()
+    {
+        var svc = CreateRemoteService();
+        await AddRemoteSession(svc, "test-session");
+
+        // Add 3 local messages (more than server's stale snapshot)
+        var session = svc.GetSession("test-session");
+        Assert.NotNull(session);
+        session!.History.Add(ChatMessage.UserMessage("msg1"));
+        session.History.Add(ChatMessage.AssistantMessage("reply1"));
+        session.History.Add(ChatMessage.UserMessage("msg2"));
+        session.MessageCount = 3;
+
+        // Activate streaming guard
+        svc.SetRemoteStreamingGuardForTesting("test-session", true);
+
+        // Server has only 2 messages (stale snapshot)
+        var serverHistory = new List<ChatMessage>
+        {
+            ChatMessage.UserMessage("msg1"),
+            ChatMessage.AssistantMessage("reply1")
+        };
+        _bridgeClient.SessionHistories["test-session"] = serverHistory;
+
+        var result = await svc.ForceRefreshRemoteAsync("test-session");
+
+        Assert.True(result.Success);
+        // Should NOT have replaced — local has more messages
+        Assert.Equal(3, session.History.Count);
+    }
+
+    [Fact]
+    public async Task ForceSync_WhenStreamingGuardActive_SameCount_SkipsApply()
+    {
+        var svc = CreateRemoteService();
+        await AddRemoteSession(svc, "test-session");
+
+        // Add 3 local messages
+        var session = svc.GetSession("test-session");
+        Assert.NotNull(session);
+        session!.History.Add(ChatMessage.UserMessage("local-msg1"));
+        session.History.Add(ChatMessage.AssistantMessage("local-reply1"));
+        session.History.Add(ChatMessage.UserMessage("local-msg2"));
+        session.MessageCount = 3;
+
+        // Activate streaming guard
+        svc.SetRemoteStreamingGuardForTesting("test-session", true);
+
+        // Server has same count but different content (stale snapshot)
+        var serverHistory = new List<ChatMessage>
+        {
+            ChatMessage.UserMessage("server-msg1"),
+            ChatMessage.AssistantMessage("server-reply1"),
+            ChatMessage.UserMessage("server-msg2")
+        };
+        _bridgeClient.SessionHistories["test-session"] = serverHistory;
+
+        var result = await svc.ForceRefreshRemoteAsync("test-session");
+
+        Assert.True(result.Success);
+        // Should NOT replace — same count during active streaming means server snapshot is stale
+        Assert.Equal(3, session.History.Count);
+        Assert.Equal("local-msg1", session.History[0].Content);
+    }
+
+    [Fact]
+    public async Task ForceSync_WhenNotStreaming_AlwaysAppliesServerHistory()
+    {
+        var svc = CreateRemoteService();
+        await AddRemoteSession(svc, "test-session");
+
+        // Add 3 local messages
+        var session = svc.GetSession("test-session");
+        Assert.NotNull(session);
+        session!.History.Add(ChatMessage.UserMessage("msg1"));
+        session.History.Add(ChatMessage.AssistantMessage("reply1"));
+        session.History.Add(ChatMessage.UserMessage("msg2"));
+        session.MessageCount = 3;
+
+        // No streaming guard active
+        Assert.False(svc.IsRemoteStreamingGuardActive("test-session"));
+
+        // Server has only 2 messages — but since not streaming, should still apply
+        var serverHistory = new List<ChatMessage>
+        {
+            ChatMessage.UserMessage("msg1"),
+            ChatMessage.AssistantMessage("reply1")
+        };
+        _bridgeClient.SessionHistories["test-session"] = serverHistory;
+
+        var result = await svc.ForceRefreshRemoteAsync("test-session");
+
+        Assert.True(result.Success);
+        Assert.Equal(2, session.History.Count);
+        Assert.Equal(2, session.MessageCount);
+    }
 }
