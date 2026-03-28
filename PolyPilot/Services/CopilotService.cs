@@ -2072,7 +2072,7 @@ The user can also check configured servers with the /mcp command.
         }
 
         // Resume the session using the SDK — pass model and working directory so backend context is preserved
-        var resumeModel = Models.ModelHelper.NormalizeToSlug(model ?? GetSessionModelFromDisk(sessionId) ?? DefaultModel);
+        var resumeModel = Models.ModelHelper.NormalizeToSlug(GetSessionModelFromDisk(sessionId) ?? model ?? DefaultModel);
         if (string.IsNullOrEmpty(resumeModel)) resumeModel = DefaultModel;
         Debug($"Resuming session '{displayName}' with model: '{resumeModel}', cwd: '{resumeWorkingDirectory}'");
         var resumeConfig = new ResumeSessionConfig { Model = resumeModel, WorkingDirectory = resumeWorkingDirectory, Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() }, OnPermissionRequest = AutoApprovePermissions };
