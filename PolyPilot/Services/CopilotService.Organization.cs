@@ -38,7 +38,10 @@ public partial class CopilotService
     private static readonly TimeSpan WorkerExecutionTimeoutRemote = TimeSpan.FromMinutes(10);
     private static readonly Regex WorkerNamePattern = new(@"-[Ww]orker-\d+(-\d+)?$", RegexOptions.Compiled);
 
-    /// <summary>How long to poll for premature idle indicators after the initial TCS completes.
+    /// <summary>Maximum time the orchestrator waits for all workers to complete.
+    /// Shorter than WorkerExecutionTimeout — if a worker is stuck, the orchestrator
+    /// proceeds with partial results rather than blocking the group forever.</summary>
+    private static readonly TimeSpan OrchestratorCollectionTimeout = TimeSpan.FromMinutes(15);
     /// Checks both WasPrematurelyIdled flag (set by EVT-REARM) and events.jsonl freshness
     /// (CLI still writing events). The events.jsonl check catches cases where EVT-REARM
     /// takes 30-60s to fire.</summary>
@@ -80,6 +83,11 @@ public partial class CopilotService
     // Drained at the start of each loop iteration and sent to the orchestrator
     // so the model sees them in its conversation context.
     private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _reflectQueuedPrompts = new();
+
+    // Per-group queued user prompts for non-reflect Orchestrator mode.
+    // When a user sends a message while an orchestrator dispatch is running,
+    // the message is queued here and drained after the current dispatch completes.
+    private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _orchestratorQueuedPrompts = new();
 
     #region Session Organization (groups, pinning, sorting)
 
@@ -1030,6 +1038,9 @@ public partial class CopilotService
 
         // Collect all worktree IDs for cleanup before removing metadata
         var worktreeIds = new HashSet<string>();
+
+        // Clean up orchestrator queue state for this group
+        _orchestratorQueuedPrompts.TryRemove(groupId, out _);
         if (group2?.WorktreeId != null) worktreeIds.Add(group2.WorktreeId);
         // CreatedWorktreeIds is the authoritative list (covers cases where session creation failed)
         if (group2?.CreatedWorktreeIds != null)
@@ -1637,9 +1648,31 @@ public partial class CopilotService
         if (members.Count == 0) { Debug($"[DISPATCH] SendToMultiAgentGroupAsync: no members for group '{group.Name}'"); return; }
 
         // Serialize dispatches to the same group (bridge + event queue drain race).
-        // Callers wait their turn rather than being dropped.
+        // For Orchestrator mode: non-blocking check — queue if busy, with user feedback.
+        // For other modes: blocking wait (they complete quickly).
         var dispatchLock = _groupDispatchLocks.GetOrAdd(groupId, _ => new SemaphoreSlim(1, 1));
-        await dispatchLock.WaitAsync(cancellationToken);
+
+        if (group.OrchestratorMode == MultiAgentMode.Orchestrator)
+        {
+            if (!dispatchLock.Wait(0))
+            {
+                // Orchestrator is busy — queue the prompt and show feedback
+                var orchestratorName = GetOrchestratorSession(groupId);
+                Debug($"[DISPATCH] Orchestrator busy for group '{group.Name}' — queuing prompt for after current dispatch");
+                var queue = _orchestratorQueuedPrompts.GetOrAdd(groupId, _ => new ConcurrentQueue<string>());
+                queue.Enqueue(prompt);
+                if (orchestratorName != null)
+                {
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"📨 New task queued (will be sent to orchestrator when current work completes): {prompt}");
+                }
+                return;
+            }
+        }
+        else
+        {
+            await dispatchLock.WaitAsync(cancellationToken);
+        }
 
         try
         {
@@ -1657,6 +1690,8 @@ public partial class CopilotService
 
                 case MultiAgentMode.Orchestrator:
                     await SendViaOrchestratorAsync(groupId, members, prompt, cancellationToken);
+                    // Drain any prompts queued while this dispatch was running
+                    await DrainOrchestratorQueueAsync(groupId, members, cancellationToken);
                     break;
 
                 case MultiAgentMode.OrchestratorReflect:
@@ -1676,9 +1711,54 @@ public partial class CopilotService
     }
 
     /// <summary>
-    /// Build a multi-agent context prefix for a session in a group.
-    /// Includes model info for each member so agents know each other's capabilities.
+    /// Drain queued user prompts that arrived while a non-reflect orchestrator dispatch was running.
+    /// Each queued prompt is sent to the orchestrator as a new task, which dispatches to available workers.
+    /// Called while still holding the dispatch lock, so no new dispatches can interleave.
+    /// Capped at 3 per cycle to prevent unbounded lock holding.
     /// </summary>
+    private async Task DrainOrchestratorQueueAsync(string groupId, List<string> members, CancellationToken cancellationToken)
+    {
+        if (!_orchestratorQueuedPrompts.TryGetValue(groupId, out var queue))
+            return;
+
+        const int maxDrainPerCycle = 3;
+        int drained = 0;
+        while (drained < maxDrainPerCycle && queue.TryDequeue(out var queuedPrompt))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Debug($"[DISPATCH] Draining queued orchestrator prompt for group '{groupId}' (len={queuedPrompt.Length})");
+
+            try
+            {
+                await SendViaOrchestratorAsync(groupId, members, queuedPrompt, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                Debug($"[DISPATCH] Queued orchestrator prompt failed: {ex.GetType().Name}: {ex.Message}");
+                var orchestratorName = GetOrchestratorSession(groupId);
+                if (orchestratorName != null)
+                {
+                    AddOrchestratorSystemMessage(orchestratorName,
+                        $"⚠️ Failed to process queued task: {ex.Message}");
+                }
+            }
+            drained++;
+        }
+
+        // If there are still queued prompts, notify the user
+        if (queue.Count > 0)
+        {
+            Debug($"[DISPATCH] {queue.Count} queued prompt(s) remain after draining {drained} — will process on next cycle");
+            var orchName = GetOrchestratorSession(groupId);
+            if (orchName != null)
+            {
+                AddOrchestratorSystemMessage(orchName,
+                    $"📨 {queue.Count} queued message(s) remaining — will process after this cycle completes.");
+            }
+        }
+    }
+
+    /// <summary>
     private string BuildMultiAgentPrefix(string sessionName, SessionGroup group, List<string> allMembers)
     {
         var meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == sessionName);
@@ -1848,7 +1928,53 @@ public partial class CopilotService
                 if (workerTasks.Count < assignments.Count)
                     await Task.Delay(1000, cancellationToken);
             }
-            var results = await Task.WhenAll(workerTasks);
+
+            // Bounded wait: if any worker is stuck, proceed with partial results
+            // rather than blocking the entire orchestrator group indefinitely.
+            var allDone = Task.WhenAll(workerTasks);
+            // Use CancellationToken.None for the timeout delay — if the caller's token
+            // is cancelled, Task.WhenAny returns the cancelled allDone (not timeout),
+            // and OperationCanceledException propagates cleanly without entering the
+            // force-complete branch.
+            var timeout = Task.Delay(OrchestratorCollectionTimeout, CancellationToken.None);
+            WorkerResult[] results;
+            if (await Task.WhenAny(allDone, timeout) != allDone)
+            {
+                Debug($"[DISPATCH] Orchestrator collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m) — force-completing stuck workers");
+                foreach (var a in assignments)
+                {
+                    if (_sessions.TryGetValue(a.WorkerName, out var ws))
+                    {
+                        if (ws.Info.IsProcessing)
+                        {
+                            Debug($"[DISPATCH] Force-completing stuck worker '{a.WorkerName}'");
+                            AddOrchestratorSystemMessage(a.WorkerName,
+                                "⚠️ Worker timed out — orchestrator is proceeding with partial results.");
+                            await ForceCompleteProcessingAsync(a.WorkerName, ws, $"orchestrator collection timeout ({OrchestratorCollectionTimeout.TotalMinutes}m)");
+                        }
+                        else if (ws.ResponseCompletion?.Task.IsCompleted == false)
+                        {
+                            // Worker hasn't started processing yet (e.g., stuck in SendAsync).
+                            // Resolve the TCS so ExecuteWorkerAsync unblocks.
+                            Debug($"[DISPATCH] Resolving TCS for non-processing worker '{a.WorkerName}'");
+                            ws.ResponseCompletion?.TrySetResult("(worker timed out — never started processing)");
+                        }
+                    }
+                }
+                // Collect results — all tasks should now be completed (force-completed or already done).
+                // Use try/catch since force-completed tasks may fault.
+                var partialResults = new List<WorkerResult>();
+                foreach (var t in workerTasks)
+                {
+                    try { partialResults.Add(await t); }
+                    catch (Exception ex) { partialResults.Add(new WorkerResult("unknown", null, false, $"Error: {ex.Message}", TimeSpan.Zero)); }
+                }
+                results = partialResults.ToArray();
+            }
+            else
+            {
+                results = await allDone;
+            }
 
             // After early dispatch, the orchestrator may still be doing tool work.
             await WaitForSessionIdleAsync(orchestratorName, cancellationToken);
