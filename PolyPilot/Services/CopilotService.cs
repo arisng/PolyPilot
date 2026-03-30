@@ -82,6 +82,7 @@ public partial class CopilotService : IAsyncDisposable
     private CancellationTokenSource? _codespaceHealthCts;
     private CancellationTokenSource? _authPollCts;
     private readonly object _authPollLock = new();
+    private readonly SemaphoreSlim _tokenResolutionLock = new(1, 1);
     private string? _resolvedGitHubToken;
     private Task? _codespaceHealthTask;
     // Cached dotfiles status — checked once when first SetupRequired state is encountered
@@ -742,7 +743,11 @@ public partial class CopilotService : IAsyncDisposable
         {
             Debug($"[HEALTH] Ping failed after resume/wake ({ex.Message}) — attempting persistent server recovery");
             if (CurrentMode == ConnectionMode.Persistent)
-                _ = Task.Run(() => TryRecoverPersistentServerAsync(), CancellationToken.None);
+                _ = Task.Run(async () =>
+                {
+                    var recovered = await TryRecoverPersistentServerAsync();
+                    if (recovered) _ = CheckAuthStatusAsync();
+                }, CancellationToken.None);
         }
     }
 
@@ -926,10 +931,12 @@ public partial class CopilotService : IAsyncDisposable
         // In Persistent mode, auto-start the server if not already running
         if (settings.Mode == ConnectionMode.Persistent)
         {
-            // Resolve a GitHub token that can be forwarded to the headless server.
-            // This handles the case where the Keychain entry created by `copilot login`
-            // is inaccessible to a headless process (macOS Keychain ACL restriction).
-            _resolvedGitHubToken ??= await Task.Run(() => ResolveGitHubTokenForServer());
+            // Only forward tokens from env vars at startup — no Keychain read (would
+            // trigger a macOS password dialog for every user). If the server can't
+            // self-authenticate, CheckAuthStatusAsync below will detect it and lazily
+            // resolve the full token chain (including Keychain) on first auth failure.
+            // See .claude/skills/auth-token-safety/SKILL.md (INV-A1).
+            _resolvedGitHubToken ??= ResolveGitHubTokenFromEnv();
 
             if (!_serverManager.CheckServerRunning("127.0.0.1", settings.Port))
             {
@@ -1299,8 +1306,17 @@ public partial class CopilotService : IAsyncDisposable
                 await Task.Delay(250);
             }
 
-            // Start a fresh server — this forces the CLI to re-authenticate with GitHub
-            var started = await _serverManager.StartServerAsync(settings.Port, _resolvedGitHubToken);
+            // Save whatever token was resolved (may be null for watchdog callers, or a
+            // freshly-resolved token from ReauthenticateAsync/CheckAuthStatusAsync).
+            // Then clear the field so future auth failures trigger lazy Keychain resolution.
+            // See .claude/skills/auth-token-safety/SKILL.md (INV-A3).
+            var tokenToForward = _resolvedGitHubToken;
+            _resolvedGitHubToken = null;
+
+            // Start a fresh server — forwards the saved token (if any) or null to let
+            // the server try native Keychain auth. If native auth fails and tokenToForward
+            // was null, CheckAuthStatusAsync will lazily resolve a fresh token.
+            var started = await _serverManager.StartServerAsync(settings.Port, tokenToForward);
             if (!started)
             {
                 Debug("[SERVER-RECOVERY] Failed to restart persistent server");
@@ -4752,6 +4768,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             try { await _client.DisposeAsync(); } catch { }
         }
         _recoveryLock.Dispose();
+        _tokenResolutionLock.Dispose();
     }
 
     private void StartExternalSessionScannerIfNeeded()
