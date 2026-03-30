@@ -80,6 +80,9 @@ public partial class CopilotService : IAsyncDisposable
     private readonly ConcurrentDictionary<string, CodespaceService.TunnelHandle> _tunnelHandles = new();
     // Codespace health-check background task
     private CancellationTokenSource? _codespaceHealthCts;
+    private CancellationTokenSource? _authPollCts;
+    private readonly object _authPollLock = new();
+    private string? _resolvedGitHubToken;
     private Task? _codespaceHealthTask;
     // Cached dotfiles status — checked once when first SetupRequired state is encountered
     private CodespaceService.DotfilesStatus? _dotfilesStatus;
@@ -291,6 +294,62 @@ public partial class CopilotService : IAsyncDisposable
     public string? ServerHealthNotice { get; private set; }
     public void ClearServerHealthNotice() => ServerHealthNotice = null;
     public void SetServerHealthNotice(string notice) => ServerHealthNotice = notice;
+
+    // Auth notice — shown when the CLI server is not authenticated
+    public string? AuthNotice { get; private set; }
+    public void ClearAuthNotice()
+    {
+        StopAuthPolling();
+        InvokeOnUI(() =>
+        {
+            AuthNotice = null;
+            OnStateChanged?.Invoke();
+        });
+    }
+
+    /// <summary>Returns the full `copilot login` command using the resolved CLI path.</summary>
+    public string GetLoginCommand()
+    {
+        var cliPath = ResolveCopilotCliPath(_currentSettings?.CliSource ?? CliSourceMode.BuiltIn);
+        return string.IsNullOrEmpty(cliPath) ? "copilot login" : $"\"{cliPath}\" login";
+    }
+
+    /// <summary>
+    /// Force-restarts the headless server to pick up fresh credentials, then re-checks auth.
+    /// Called from the Dashboard "Re-authenticate" button after the user runs `copilot login`.
+    /// </summary>
+    public async Task ReauthenticateAsync()
+    {
+        StopAuthPolling();
+        Debug("[AUTH] Re-authenticate requested — forcing server restart to pick up new credentials");
+        // Re-resolve the token off the UI thread — spawns up to 4 child processes
+        // (3× security + 1× gh) which can block for their timeout durations.
+        _resolvedGitHubToken = await Task.Run(() => ResolveGitHubTokenForServer());
+        var recovered = await TryRecoverPersistentServerAsync();
+        if (recovered)
+        {
+            var isAuthenticated = await CheckAuthStatusAsync();
+            if (isAuthenticated)
+            {
+                Debug("[AUTH] Re-authentication successful");
+                _ = FetchGitHubUserInfoAsync();
+            }
+            else
+            {
+                Debug("[AUTH] Server restarted but still not authenticated");
+                // CheckAuthStatusAsync already set AuthNotice and started polling
+            }
+        }
+        else
+        {
+            InvokeOnUI(() =>
+            {
+                AuthNotice = "Server restart failed — please try running `copilot login` again.";
+                StartAuthPolling();
+                OnStateChanged?.Invoke();
+            });
+        }
+    }
 
     // GitHub user info
     public string? GitHubAvatarUrl { get; private set; }
@@ -867,10 +926,15 @@ public partial class CopilotService : IAsyncDisposable
         // In Persistent mode, auto-start the server if not already running
         if (settings.Mode == ConnectionMode.Persistent)
         {
+            // Resolve a GitHub token that can be forwarded to the headless server.
+            // This handles the case where the Keychain entry created by `copilot login`
+            // is inaccessible to a headless process (macOS Keychain ACL restriction).
+            _resolvedGitHubToken ??= await Task.Run(() => ResolveGitHubTokenForServer());
+
             if (!_serverManager.CheckServerRunning("127.0.0.1", settings.Port))
             {
                 Debug($"Persistent server not running, auto-starting on port {settings.Port}...");
-                var started = await _serverManager.StartServerAsync(settings.Port);
+                var started = await _serverManager.StartServerAsync(settings.Port, _resolvedGitHubToken);
                 if (!started)
                 {
                     Debug("Failed to auto-start server, falling back to Embedded mode");
@@ -917,7 +981,7 @@ public partial class CopilotService : IAsyncDisposable
                 await Task.Delay(250, cancellationToken);
             }
 
-            var restarted = await _serverManager.StartServerAsync(settings.Port);
+            var restarted = await _serverManager.StartServerAsync(settings.Port, _resolvedGitHubToken);
             if (restarted)
             {
                 Debug("Server restarted, retrying connection...");
@@ -991,6 +1055,9 @@ public partial class CopilotService : IAsyncDisposable
 
         // Fetch GitHub user info for avatar
         _ = FetchGitHubUserInfoAsync();
+
+        // Check auth status — surface a banner if not authenticated
+        _ = CheckAuthStatusAsync();
 
         // Load organization state FIRST (groups, pinning, sorting) so reconcile during restore doesn't wipe it
         LoadOrganization();
@@ -1121,6 +1188,9 @@ public partial class CopilotService : IAsyncDisposable
         IsRemoteMode = false;
         IsDemoMode = false;
         FallbackNotice = null; // Clear any previous fallback notice
+        AuthNotice = null; // Clear any previous auth notice
+        _resolvedGitHubToken = null; // Force re-resolve on next server start
+        StopAuthPolling();
         CurrentMode = settings.Mode;
         CodespacesEnabled = settings.CodespacesEnabled && settings.Mode == ConnectionMode.Embedded;
         OnStateChanged?.Invoke();
@@ -1230,7 +1300,7 @@ public partial class CopilotService : IAsyncDisposable
             }
 
             // Start a fresh server — this forces the CLI to re-authenticate with GitHub
-            var started = await _serverManager.StartServerAsync(settings.Port);
+            var started = await _serverManager.StartServerAsync(settings.Port, _resolvedGitHubToken);
             if (!started)
             {
                 Debug("[SERVER-RECOVERY] Failed to restart persistent server");
@@ -1328,7 +1398,7 @@ public partial class CopilotService : IAsyncDisposable
             }
 
             // 5. Start fresh server (will extract current native modules)
-            var started = await _serverManager.StartServerAsync(restartSettings.Port);
+            var started = await _serverManager.StartServerAsync(restartSettings.Port, _resolvedGitHubToken);
             if (!started)
             {
                 Debug("[SERVER-RESTART] Failed to restart server");
@@ -2541,7 +2611,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 if (!_serverManager.CheckServerRunning("127.0.0.1", settings.Port))
                 {
                     Debug("Persistent server not running, restarting...");
-                    var started = await _serverManager.StartServerAsync(settings.Port);
+                    var started = await _serverManager.StartServerAsync(settings.Port, _resolvedGitHubToken);
                     if (!started)
                     {
                         Debug("Failed to restart persistent server");
@@ -3288,7 +3358,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                             if (CurrentMode == ConnectionMode.Persistent &&
                                 !_serverManager.CheckServerRunning("127.0.0.1", reinitSettings.Port))
                             {
-                                await _serverManager.StartServerAsync(reinitSettings.Port);
+                                await _serverManager.StartServerAsync(reinitSettings.Port, _resolvedGitHubToken);
                             }
                             _client = CreateClient(reinitSettings);
                             await _client.StartAsync(cancellationToken);
@@ -3329,7 +3399,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                                     !_serverManager.CheckServerRunning("127.0.0.1", connSettings.Port))
                                 {
                                     Debug("Persistent server not running, restarting...");
-                                    var started = await _serverManager.StartServerAsync(connSettings.Port);
+                                    var started = await _serverManager.StartServerAsync(connSettings.Port, _resolvedGitHubToken);
                                     if (!started)
                                     {
                                         Debug("Failed to restart persistent server");
@@ -4640,6 +4710,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         StopKeepalivePing();
         await StopCodespaceHealthCheckAsync();
         StopExternalSessionScanner();
+        StopAuthPolling();
 
         // Flush any pending debounced writes immediately
         FlushSaveActiveSessionsToDisk();
