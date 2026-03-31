@@ -455,6 +455,7 @@ public partial class CopilotService
     {
         var msg = ex.Message;
         if (ex is System.IO.IOException or System.Net.Sockets.SocketException or ObjectDisposedException
+            or TimeoutException // SendAsync timeout means server isn't responding — connection is dead
             || msg.Contains("connection refused", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("connection reset", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("connection was closed", StringComparison.OrdinalIgnoreCase)
@@ -794,13 +795,13 @@ public partial class CopilotService
             if (modelList != null && modelList.Count > 0)
             {
                 var models = modelList
-                    .Where(m => !string.IsNullOrEmpty(m.Name))
-                    .Select(m => m.Name!)
+                    .Where(m => !string.IsNullOrEmpty(m.Id))
+                    .Select(m => m.Id!)
                     .OrderBy(m => m)
                     .ToList();
                 if (models.Count > 0)
                 {
-                    AvailableModels = models;
+                    _localAvailableModels = models;
                     Debug($"Loaded {models.Count} models from SDK");
                     OnStateChanged?.Invoke();
                 }
