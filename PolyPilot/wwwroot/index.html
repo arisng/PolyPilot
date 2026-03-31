@@ -22,6 +22,27 @@
         <span class="dismiss">🗙</span>
     </div>
 
+    <script>
+        // Prevent PR badge clicks from selecting the parent session.
+        // MUST be loaded BEFORE blazor.webview.js so our capture-phase handler
+        // runs before Blazor's event delegation. stopImmediatePropagation only
+        // blocks listeners registered AFTER this one.
+        ['click', 'pointerdown', 'pointerup', 'mousedown', 'mouseup'].forEach(function(evtName) {
+            document.addEventListener(evtName, function(e) {
+                var badge = e.target.closest('.pr-badge');
+                if (badge) {
+                    e.stopImmediatePropagation();
+                    e.preventDefault();
+                    if (evtName === 'click') {
+                        var url = badge.getAttribute('title');
+                        if (url && url.startsWith('https://') && window.__dashRef) {
+                            window.__dashRef.invokeMethodAsync('JsOpenUrlInBackground', url).catch(function(){});
+                        }
+                    }
+                }
+            }, true);
+        });
+    </script>
     <script src="_framework/blazor.webview.js" autostart="false"></script>
     <script src="chobitsu.js"></script>
     <script>

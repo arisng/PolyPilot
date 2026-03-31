@@ -260,7 +260,11 @@ public partial class CopilotService : IAsyncDisposable
     public string? ActiveSessionName => _activeSessionName;
     public IChatDatabase ChatDb => _chatDb;
     public ConnectionMode CurrentMode { get; private set; } = ConnectionMode.Embedded;
-    public List<string> AvailableModels { get; private set; } = new();
+    public List<string> AvailableModels =>
+        IsRemoteMode && _bridgeClient.AvailableModels.Count > 0
+            ? _bridgeClient.AvailableModels
+            : _localAvailableModels;
+    private List<string> _localAvailableModels = new();
 
     private readonly RepoManager _repoManager;
     private readonly CodespaceService _codespaceService;
@@ -648,6 +652,14 @@ public partial class CopilotService : IAsyncDisposable
         /// for reconnected sends so a dead event stream (CLI event writer broken after re-resume)
         /// is detected in ~30s rather than waiting the full 120s.</summary>
         public volatile bool IsReconnectedSend;
+
+        /// <summary>Set to true by AbortSessionAsync when the user explicitly clicks Stop.
+        /// Prevents EVT-REARM (AssistantTurnStartEvent re-arming IsProcessing after a premature
+        /// session.idle) from firing on in-flight TurnStart events that arrived AFTER the user
+        /// aborted. Without this guard, clicking Stop while the SDK is mid-turn causes the
+        /// session to restart processing on its own ("continued without me sending a message").
+        /// Cleared by SendPromptAsync at the start of each new turn.</summary>
+        public volatile bool WasUserAborted;
     }
 
     private static void DisposePrematureIdleSignal(SessionState? state)
@@ -962,7 +974,18 @@ public partial class CopilotService : IAsyncDisposable
 
         try
         {
-            await _client.StartAsync(cancellationToken);
+            // Timeout prevents hanging forever if the server is unresponsive
+            using var startCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            startCts.CancelAfter(TimeSpan.FromSeconds(30));
+            try
+            {
+                await _client.StartAsync(startCts.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Our 30s timeout fired, not the caller's token — convert to a descriptive exception
+                throw new TimeoutException("Client StartAsync did not complete within 30 seconds — server may be unresponsive");
+            }
             IsInitialized = true;
             NeedsConfiguration = false;
             Debug($"Copilot client started in {settings.Mode} mode");
@@ -970,11 +993,13 @@ public partial class CopilotService : IAsyncDisposable
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex) when (settings.Mode == ConnectionMode.Persistent
-            && ex.Message.Contains("version mismatch", StringComparison.OrdinalIgnoreCase))
+            && (ex.Message.Contains("version mismatch", StringComparison.OrdinalIgnoreCase)
+                || ex is TimeoutException))
         {
-            // The persistent server is running an older/newer protocol version than the SDK.
+            // The persistent server is unresponsive or running an older/newer protocol version.
             // Kill it, restart with the current CLI, and retry once.
-            Debug($"Protocol version mismatch with persistent server — restarting: {ex.Message}");
+            var reason = ex is TimeoutException ? "unresponsive (StartAsync timeout)" : "version mismatch";
+            Debug($"Persistent server {reason} — restarting: {ex.Message}");
             try { await _client.DisposeAsync(); } catch { }
             _client = null;
 
@@ -1009,7 +1034,7 @@ public partial class CopilotService : IAsyncDisposable
                     _client = null;
                     IsInitialized = false;
                     NeedsConfiguration = true;
-                    FallbackNotice = BuildServerFallbackNotice(null, Path.Combine(PolyPilotBaseDir, "event-diagnostics.log"), "version mismatch restart failed — reconnection failed", embeddedFallback: false);
+                    FallbackNotice = BuildServerFallbackNotice(null, Path.Combine(PolyPilotBaseDir, "event-diagnostics.log"), $"{reason} restart failed — reconnection failed", embeddedFallback: false);
                     OnStateChanged?.Invoke();
                     return;
                 }
@@ -1018,7 +1043,7 @@ public partial class CopilotService : IAsyncDisposable
             {
                 Debug("Server restart failed, falling back to Embedded mode");
                 CurrentMode = ConnectionMode.Embedded;
-                FallbackNotice = BuildServerFallbackNotice(null, Path.Combine(PolyPilotBaseDir, "event-diagnostics.log"), "had a version mismatch and couldn't restart");
+                FallbackNotice = BuildServerFallbackNotice(null, Path.Combine(PolyPilotBaseDir, "event-diagnostics.log"), $"had {reason} and couldn't restart");
                 var embeddedSettings = new ConnectionSettings { Mode = ConnectionMode.Embedded, Host = settings.Host, Port = settings.Port };
                 _client = CreateClient(embeddedSettings);
                 try
@@ -3242,6 +3267,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.HasUsedToolsThisTurn = false; // Reset stale tool flag from previous turn
         state.HasDeferredIdle = false; // Reset deferred idle flag from previous turn
         state.IsReconnectedSend = false; // Clear reconnect flag — new turn starts fresh (see watchdog reconnect timeout)
+        state.WasUserAborted = false; // Clear abort flag — new turn starts fresh (re-enables EVT-REARM)
         state.PrematureIdleSignal.Reset(); // Clear premature idle detection from previous turn
         state.FallbackCanceledByTurnStart = false;
         Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
@@ -3788,6 +3814,16 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     catch { /* filesystem errors — watchdog will skip dead-send check */ }
                     StartProcessingWatchdog(state, sessionName);
 
+                    // Skip retry if the CLI is already processing our prompt (persistent mode
+                    // kept the headless server running tools while the connection was dead).
+                    // Re-sending would duplicate the prompt. Events from the running session will
+                    // arrive via newSession's handler; the watchdog handles eventual completion.
+                    if (!string.IsNullOrEmpty(state.Info.SessionId) && IsSessionStillProcessing(state.Info.SessionId))
+                    {
+                        Debug($"[RECONNECT-SKIP-RETRY] '{sessionName}' CLI is still processing — skipping prompt retry, waiting for events");
+                        return string.Empty; // IsProcessing=true, watchdog running — events will complete the turn
+                    }
+
                     Debug($"[RECONNECT] '{sessionName}' retrying prompt (len={prompt.Length})...");
                     var retryOptions = new MessageOptions
                     {
@@ -3985,6 +4021,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
         Debug($"[ABORT] '{sessionName}' user abort, clearing IsProcessing");
         state.Info.IsProcessing = false;
+        state.WasUserAborted = true; // Suppress EVT-REARM for in-flight TurnStart events after abort
         state.Info.IsResumed = false;
         if (state.Info.ProcessingStartedAt is { } abortStarted)
             state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - abortStarted).TotalSeconds;
@@ -4042,6 +4079,16 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // Soft steer is only available for real SDK sessions (not demo/remote which lack CopilotSession).
         if (state.Info.IsProcessing && toolsActiveOrUsed && !IsDemoMode && !IsRemoteMode && state.Session != null)
         {
+            // Pre-check: if no SDK events have arrived in 30+ seconds, the connection is likely dead.
+            // Skip soft steer entirely and go straight to hard steer (abort + re-send with reconnect).
+            var secsSinceLastEvent = (DateTime.UtcNow.Ticks - Interlocked.Read(ref state.LastEventAtTicks)) / TimeSpan.TicksPerSecond;
+            if (secsSinceLastEvent > 30)
+            {
+                Debug($"[STEER-SKIP-SOFT] '{sessionName}' last SDK event was {secsSinceLastEvent}s ago — connection likely dead, going to hard steer");
+                // Fall through to hard steer below
+            }
+            else
+            {
             // Soft steer: inject into the current agentic turn via ImmediatePromptProcessor.
             // The current tool call(s) finish cleanly; the steering message is prepended to
             // the next LLM call within this turn, preserving full tool context.
@@ -4066,9 +4113,17 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             bool softSteerSucceeded = false;
             try
             {
-                // NOTE: No cancellationToken passed (implicitly CancellationToken.None).
-                // This is intentional — see issue #319 for the SDK RequestId serialization bug.
-                await state.Session.SendAsync(softSteerOptions);
+                // Timeout prevents hanging forever on a dead connection.
+                // 15s is shorter than the normal 60s SendAsync timeout since steer injection should be fast.
+                var sendTask = state.Session.SendAsync(softSteerOptions);
+                var completed = await Task.WhenAny(sendTask, Task.Delay(15_000));
+                if (completed != sendTask)
+                {
+                    // Observe the abandoned sendTask's exception to prevent UnobservedTaskException on GC.
+                    _ = sendTask.ContinueWith(static t => { _ = t.Exception; }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+                    throw new TimeoutException("Soft steer SendAsync did not complete within 15s — connection likely dead");
+                }
+                await sendTask; // propagate any exception
                 softSteerSucceeded = true;
                 // Write to DB only after successful send to avoid orphaned entries on connection errors.
                 if (!string.IsNullOrEmpty(state.Info.SessionId))
@@ -4104,6 +4159,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 state.HasDeferredIdle = false;
                 Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
+                state.IsReconnectedSend = false; // INV-1 item 8: prevent stale 35s timeout on next watchdog start
                 Interlocked.Exchange(ref state.SendingFlag, 0);
                 // Clear IsProcessing BEFORE completing TCS (INV-O3)
                 state.Info.IsProcessing = false;
@@ -4129,7 +4185,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             if (softSteerSucceeded)
                 return;
             // Connection error was caught above — fall through to hard steer.
-        }
+            } // end else (connection not stale)
+        } // end if (soft steer eligible)
 
         // Hard steer: abort current streaming turn immediately, mark partial response as
         // interrupted, then start a fresh turn with the steering message.
