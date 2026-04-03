@@ -136,15 +136,27 @@ public partial class CopilotService
             var type = doc.RootElement.GetProperty("type").GetString();
             if (type == null) return false; // Corrupt/partial event — treat as terminal
 
-            // Use a blacklist of terminal events rather than a whitelist of active ones.
-            // Any event that is NOT terminal means the session is still processing.
-            // The old whitelist missed intermediate states like assistant.turn_end (between
-            // tool rounds), assistant.message, and tool.execution_complete, causing
-            // actively-processing sessions to be incorrectly detected as idle on restore.
-            // session.idle is ephemeral (never on disk). session.start means session was
-            // created but never used — not actively processing. All are non-active states.
+            // session.idle is ephemeral (never on disk). session.start can also be the only
+            // on-disk event for a never-used session, so treat it as terminal on restore.
             var terminalEvents = new[] { "session.idle", "session.error", "session.shutdown", "session.start" };
-            return !terminalEvents.Contains(type);
+            if (terminalEvents.Contains(type)) return false;
+
+            // Smart completion for assistant.message / assistant.turn_end: session.idle is not
+            // written to disk, so a clean no-tool turn can appear to end on one of these events.
+            // Only treat it as idle if the current sub-turn shows no tool activity at all.
+            // If tools were involved, stay conservative and keep waiting for resumed events or
+            // the watchdog timeout — this avoids losing between-round tool output after relaunch.
+            if (type is "assistant.message" or "assistant.turn_end")
+            {
+                var tailTypes = GetTailEventTypes(eventsFile, 30);
+                if (tailTypes != null && tailTypes.Count > 1 && IsCleanNoToolSubturn(tailTypes))
+                {
+                    Debug($"[RESTORE] events.jsonl for '{sessionId}' ends with {type} and the current sub-turn has no tool activity — treating session as idle");
+                    return false;
+                }
+            }
+
+            return true;
         }
         catch { return false; }
     }
@@ -184,6 +196,68 @@ public partial class CopilotService
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Reads the last N event types from events.jsonl in reverse order (most recent first).
+    /// Uses a tail-read (last 8KB) to avoid full-file scan on large sessions.
+    /// Returns null on error.
+    /// </summary>
+    internal static List<string>? GetTailEventTypes(string eventsFilePath, int count)
+    {
+        try
+        {
+            if (!File.Exists(eventsFilePath)) return null;
+
+            const int tailBytes = 8192;
+            using var fs = new FileStream(eventsFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            if (fs.Length == 0) return null;
+
+            var offset = Math.Max(0, fs.Length - tailBytes);
+            fs.Seek(offset, SeekOrigin.Begin);
+            using var reader = new StreamReader(fs);
+            var lines = new List<string>();
+            while (reader.ReadLine() is { } line)
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                    lines.Add(line);
+            }
+
+            // Parse types in reverse order (most recent first)
+            var result = new List<string>();
+            for (int i = lines.Count - 1; i >= 0 && result.Count < count; i--)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(lines[i]);
+                    var t = doc.RootElement.GetProperty("type").GetString();
+                    if (t != null) result.Add(t);
+                }
+                catch { }
+            }
+            return result;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Returns true when the current sub-turn contains no tool activity before the latest
+    /// assistant.message / assistant.turn_end. The scan stops at the start of the current
+    /// sub-turn so older tool rounds don't keep a clean completion alive.
+    /// </summary>
+    internal static bool IsCleanNoToolSubturn(List<string> tailTypes)
+    {
+        for (int i = 1; i < tailTypes.Count; i++)
+        {
+            var evt = tailTypes[i];
+            if (evt.StartsWith("tool.execution_", StringComparison.Ordinal))
+                return false;
+
+            if (evt is "assistant.turn_start" or "assistant.turn_end" or "session.resume" or "session.start")
+                break;
+        }
+
+        return true;
     }
 
     /// <summary>
