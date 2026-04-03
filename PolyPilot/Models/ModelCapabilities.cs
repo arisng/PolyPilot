@@ -585,7 +585,79 @@ public record GroupPreset(string Name, string Description, string Emoji, MultiAg
                 - Include 2-4 rubric items per scenario
                 - Rubric items are evaluated by pairwise LLM comparison (with-skill vs without-skill)
 
-                ## STEP 4: Write the eval.yaml
+                ## STEP 4: Pre-write validation (MANDATORY before creating file)
+
+                Run these checks against your planned YAML BEFORE writing to disk:
+
+                ### Check 1: Assertion types
+                Every `type:` value MUST be one of exactly these 7:
+                `output_contains`, `output_not_contains`, `output_matches`, `output_not_matches`,
+                `file_exists`, `file_contains`, `exit_success`.
+                No others exist. If you wrote any other type (e.g. `tool_call_before`, `tool_call_not_contains`),
+                replace it with a `rubric:` item instead.
+
+                ### Check 2: PR/issue numbers (skip if skill doesn't reference PRs)
+                If your prompts reference PR or issue numbers, verify they exist before writing:
+                - GitHub: `gh pr view <NUMBER> --json number 2>&1`
+                - If `gh` is unavailable, or the skill targets a non-GitHub system, skip this check.
+                If the lookup fails → replace with a known-good number. Do not use invented numbers.
+
+                ### Check 3: Overfitting
+                For every `output_contains` or `output_matches` value, run:
+                ```bash
+                grep -iF "<your assertion value>" <skill-directory>/SKILL.md
+                ```
+                If grep returns a match → that assertion likely tests vocabulary, not behavior.
+                Move it to a `rubric:` item that describes the OUTCOME instead.
+                Exception: if the matched text is a CLI command or config value the agent should
+                produce, it tests behavior and may remain as an assertion.
+
+                ### Check 4: Self-contained prompts
+                Every prompt must produce signal WITHOUT external infrastructure (no live clusters,
+                no simulators or devices, no CI pipelines, no external services, no project-specific
+                build scripts). Embed failure output, config snippets, or error messages directly in
+                the prompt rather than asking the agent to run something against a live system.
+
+                ## Anti-patterns (DO NOT)
+
+                ```yaml
+                # BAD — overfitted on SKILL.md section heading:
+                - type: "output_contains"
+                  value: "Root Cause Analysis"   # literal heading from SKILL.md
+
+                # GOOD — tests behavioral outcome instead:
+                rubric:
+                  - "Agent identifies the underlying cause before proposing a fix"
+
+                # BAD — invented assertion type that doesn't exist:
+                - type: "tool_call_before"
+                  value: "read_config"
+
+                # GOOD — move ordering checks to rubric:
+                rubric:
+                  - "Agent reads the current state before making changes"
+
+                # BAD — requires a live environment, will always be Blocked:
+                prompt: "Apply the fix and run the integration test suite"
+
+                # GOOD — self-contained, embed the failure context directly:
+                prompt: |
+                  Fix this bug. The failure output from CI is:
+                  Error: connection refused at SchedulerService.reconcile (scheduler.go:87)
+                  No live environment is needed — reason from the error and the source file only.
+
+                # BAD — fake reference number (validator gets "not found", scores zero signal):
+                prompt: "Analyze incident #99999"
+
+                # GOOD — verified real reference from the current system:
+                prompt: "Analyze incident #<verified-number>"
+                ```
+
+                Note: Not all skills involve code or PRs. For non-code skills (documentation,
+                architecture decisions, incident response, cost analysis), focus rubric items on
+                reasoning quality and completeness rather than tool usage or code output.
+
+                ## STEP 5: Write the eval.yaml
 
                 ```bash
                 mkdir -p <skill-directory>/tests
@@ -602,7 +674,7 @@ public record GroupPreset(string Name, string Description, string Emoji, MultiAg
                 EVALEOF
                 ```
 
-                ## STEP 5: Validate the file
+                ## STEP 6: Validate the file
 
                 ```bash
                 cat <skill-directory>/tests/eval.yaml
