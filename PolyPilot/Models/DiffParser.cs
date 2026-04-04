@@ -32,6 +32,60 @@ public class DiffLine
 
 public static class DiffParser
 {
+    public static bool IsPlainTextViewTool(string? toolName) =>
+        string.Equals(toolName, "view", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(toolName, "read", StringComparison.OrdinalIgnoreCase);
+
+    public static bool ShouldRenderDiffView(string? text, string? toolName)
+    {
+        if (TryExtractNumberedViewOutput(text, out _))
+            return false;
+
+        // `view`/Read tool results should stay as plain file reads even if the
+        // content happens to contain unified-diff markers.
+        if (IsPlainTextViewTool(toolName))
+            return false;
+
+        return LooksLikeUnifiedDiff(text);
+    }
+
+    public static bool TryExtractNumberedViewOutput(string? text, out string plainText)
+    {
+        plainText = "";
+        if (!LooksLikeUnifiedDiff(text))
+            return false;
+
+        var files = Parse(text!);
+        if (files.Count == 0)
+            return false;
+
+        // The broken "Read" payloads are synthetic no-op self-diffs that contain
+        // only context lines (no real additions/removals). Real diffs should keep
+        // using DiffView.
+        var allLines = files.SelectMany(f => f.Hunks).SelectMany(h => h.Lines).ToList();
+        if (allLines.Count == 0 || allLines.Any(l => l.Type != DiffLineType.Context))
+            return false;
+
+        var sb = new StringBuilder();
+        foreach (var file in files)
+        {
+            foreach (var hunk in file.Hunks)
+            {
+                foreach (var line in hunk.Lines)
+                {
+                    var lineNo = line.NewLineNo ?? line.OldLineNo;
+                    if (lineNo.HasValue)
+                        sb.Append(lineNo.Value).Append(". ");
+
+                    sb.AppendLine(line.Content);
+                }
+            }
+        }
+
+        plainText = sb.ToString().TrimEnd();
+        return !string.IsNullOrWhiteSpace(plainText);
+    }
+
     public static bool LooksLikeUnifiedDiff(string? text)
     {
         if (string.IsNullOrWhiteSpace(text)) return false;
@@ -78,15 +132,22 @@ public static class DiffParser
                 continue;
             }
 
-            // Handle standard unified diffs (no "diff --git" prefix).
-            // When we see "--- " without an active file, lookahead for "+++ ".
-            if (current == null && line.StartsWith("--- ") && i + 1 < lines.Length)
+            // Handle standard unified diffs (no "diff --git" prefix) and treat
+            // each fresh ---/+++ pair followed by a hunk header as a file boundary.
+            if (line.StartsWith("--- ", StringComparison.Ordinal) &&
+                i + 2 < lines.Length)
             {
                 var nextLine = lines[i + 1].TrimEnd('\r');
-                if (nextLine.StartsWith("+++ "))
+                var afterHeader = lines[i + 2].TrimEnd('\r');
+                if (nextLine.StartsWith("+++ ", StringComparison.Ordinal) &&
+                    afterHeader.StartsWith("@@", StringComparison.Ordinal))
                 {
-                    current = new DiffFile();
-                    files.Add(current);
+                    if (current == null || current.Hunks.Count > 0)
+                    {
+                        current = new DiffFile();
+                        files.Add(current);
+                    }
+
                     hunk = null;
 
                     var oldName = line[4..].Trim();
@@ -139,7 +200,7 @@ public static class DiffParser
                 current.FileName = line[10..];
                 continue;
             }
-            if (line.StartsWith("---") || line.StartsWith("+++") || line.StartsWith("index "))
+            if (line.StartsWith("index ", StringComparison.Ordinal))
                 continue;
 
             if (line.StartsWith("@@"))
