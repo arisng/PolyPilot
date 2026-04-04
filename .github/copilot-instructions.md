@@ -2,7 +2,22 @@
 
 ## SDK-First Development
 
-Before implementing new session lifecycle, orchestration, watchdog, or event handling code, check the Copilot SDK API surface. The `copilot-sdk-reference` skill has the complete v0.2.1 API reference (453 types, 76 events, 6 hooks, 16 RPC APIs). The `processing-state-safety` and `multi-agent-orchestration` skills each contain SDK migration matrices for their domains. Prefer SDK APIs over custom implementations. When custom code is necessary, add a `// SDK-gap: <reason>` comment explaining why. When updating the SDK NuGet package, re-evaluate all three skills.
+Before implementing new session lifecycle, orchestration, watchdog, or event handling code, check the Copilot SDK API surface. The `copilot-sdk-reference` skill has the complete v0.2.1 API reference (453 types, 76 events, 6 hooks, 16 RPC APIs). The `processing-state-safety` and `multi-agent-orchestration` skills each contain SDK migration matrices for their domains. Prefer SDK APIs over custom implementations. When custom code is necessary, add a `// SDK-gap: <reason>` comment explaining why.
+
+### SDK Update Audit (run when bumping `GitHub.Copilot.SDK` version)
+
+When the user says **"Run the SDK update audit"** or updates the SDK NuGet package version:
+
+1. **Diff the XML docs** to find new/removed/changed types:
+   ```bash
+   diff <(grep 'member name="T:' ~/.nuget/packages/github.copilot.sdk/OLD_VERSION/lib/net8.0/GitHub.Copilot.SDK.xml | sort) \
+        <(grep 'member name="T:' ~/.nuget/packages/github.copilot.sdk/NEW_VERSION/lib/net8.0/GitHub.Copilot.SDK.xml | sort)
+   ```
+2. **Update `.claude/skills/copilot-sdk-reference/SKILL.md`** — add new types, events, RPC APIs, hooks, SessionConfig properties. Update version number and version history table.
+3. **Re-check migration matrices** in `processing-state-safety` and `multi-agent-orchestration` skills — any "Not adopted" items now have better SDK support? Any new APIs that replace custom code?
+4. **Update `.github/copilot-instructions.md`** — SDK Event Flow, SDK Data Types, and any behavioral claims that changed.
+5. **Check for JS-only features that moved to .NET** — especially `AgentStop`/`SubagentStop` hooks.
+6. **Create a PR** with all changes and run the multi-model review process.
 
 ## Build & Deploy Commands
 
@@ -218,13 +233,32 @@ Disabled in `Platforms/MacCatalyst/Entitlements.plist` — required for spawning
 When a prompt is sent, the SDK emits events processed by `HandleSessionEvent` in order:
 1. `SessionUsageInfoEvent` → server acknowledged, sets `ProcessingPhase=1`
 2. `AssistantTurnStartEvent` → model generating, sets `ProcessingPhase=2`
-3. `AssistantMessageDeltaEvent` → streaming content chunks
-4. `AssistantMessageEvent` → full message (may include tool requests)
-5. `ToolExecutionStartEvent` → tool activity starts, sets `ProcessingPhase=3`, increments `ToolCallCount` on complete
-6. `ToolExecutionCompleteEvent` → tool done, increments `ToolCallCount`
-7. `AssistantIntentEvent` → intent/plan updates
-8. `AssistantTurnEndEvent` → end of a sub-turn, tool loop continues. `FlushCurrentResponse` persists accumulated text before the next sub-turn.
-9. `SessionIdleEvent` → turn complete, response finalized. **Unless** `Data.BackgroundTasks` has active agents/shells — then flushes text, logs `[IDLE-DEFER]`, and keeps `IsProcessing=true` (PR #399).
+3. `AssistantReasoningDeltaEvent` → streaming reasoning chunks (if model supports reasoning)
+4. `AssistantReasoningEvent` → complete reasoning content
+5. `AssistantMessageDeltaEvent` → streaming content chunks
+6. `AssistantMessageEvent` → full message (may include tool requests)
+7. `ToolExecutionStartEvent` → tool activity starts, sets `ProcessingPhase=3`, increments `ToolCallCount` on complete
+8. `ToolExecutionCompleteEvent` → tool done, increments `ToolCallCount`
+9. `AssistantIntentEvent` → intent/plan updates
+10. `AssistantTurnEndEvent` → end of a sub-turn, tool loop continues. `FlushCurrentResponse` persists accumulated text before the next sub-turn.
+11. `SessionIdleEvent` → turn complete, response finalized. **Unless** `Data.BackgroundTasks` has active agents/shells — then flushes text, logs `[IDLE-DEFER]`, and keeps `IsProcessing=true` (PR #399).
+
+Additional SDK events (not in the main flow but emitted during sessions):
+- `AssistantUsageEvent` — per-call token usage, cost, latency metrics
+- `AssistantStreamingDeltaEvent` — low-level streaming delta
+- `SubagentStartedEvent` / `SubagentCompletedEvent` / `SubagentFailedEvent` / `SubagentSelectedEvent` / `SubagentDeselectedEvent` — subagent lifecycle
+- `SessionPlanChangedEvent` — plan file created/updated/deleted
+- `SessionModeChangedEvent` — mode switched (interactive/plan/autopilot)
+- `SessionModelChangeEvent` — model switched mid-session (includes `PreviousModel`/`NewModel` and `PreviousReasoningEffort`/`ReasoningEffort`)
+- `SessionCompactionStartEvent` / `SessionCompactionCompleteEvent` — context compaction
+- `SessionTruncationEvent` — context truncated
+- `SessionHandoffEvent` — session handoff (source, context, repository info)
+- `SkillInvokedEvent` — a skill was invoked
+- `SessionBackgroundTasksChangedEvent` — background task status changed
+- `CapabilitiesChangedEvent` — session capabilities changed (new in v0.2.1)
+- `SamplingRequestedEvent` / `SamplingCompletedEvent` — MCP sampling (new in v0.2.1)
+
+See the `copilot-sdk-reference` skill (PR #486) for the complete list of 76 event types.
 
 ### Processing Status Indicator
 `AgentSessionInfo` tracks three fields for the processing status UI:
@@ -298,10 +332,12 @@ When a user changes the model via the UI dropdown:
 `GetSessionModel` prioritizes: (1) user's explicit choice (`session.Model`), (2) backend-reported model from usage info, (3) `DefaultModel` fallback. `ShouldAcceptObservedModel()` in `ModelHelper.cs` prevents `SessionUsageInfoEvent` and `AssistantUsageEvent` from overwriting an explicit user model selection — the observed model is only accepted if no explicit choice was made or if the observed model matches the explicit choice.
 
 ### SDK Data Types
-- `AssistantUsageData` properties (`InputTokens`, `OutputTokens`, etc.) are `Double?` not `int?`
+- `AssistantUsageData` properties (`InputTokens`, `OutputTokens`, `CacheReadTokens`, `CacheWriteTokens`) are `Double?` not `int?`
 - Use `Convert.ToInt32(value)` for conversion, not `value as int?`
-- `QuotaSnapshots` is `Dictionary<string, object>` with `JsonElement` values
-- Premium quota fields: `isUnlimitedEntitlement`, `entitlementRequests`, `usedRequests`, `remainingPercentage`, `resetDate`
+- `AssistantUsageData` also includes: `Model`, `Cost` (billing multiplier), `Duration` (ms), `TtftMs` (time to first token), `InterTokenLatencyMs`, `ReasoningEffort`, `Initiator` (e.g., "sub-agent", "mcp-sampling"), `CopilotUsage`, `ApiCallId`, `ProviderCallId`, `ParentToolCallId`
+- `QuotaSnapshots` is `Dictionary<string, object>` with `JsonElement` values — the typed fields (`EntitlementRequests`, `UsedRequests`, `RemainingPercentage`, `Overage`, `OverageAllowedWithExhaustedQuota`, `ResetDate`) are defined on `Rpc.AccountGetQuotaResultQuotaSnapshotsValue`
+- `SessionIdleData` includes `BackgroundTasks` (agents + shells) and `Aborted` (bool?, true when turn was cancelled via abort)
+- `MessageOptions` has 3 properties: `Prompt`, `Attachments`, `Mode` — no `Model` or `ReasoningEffort` (those are session-level via `SwitchToAsync`)
 
 ### Blazor Input Performance
 Avoid `@bind:event="oninput"` — causes round-trip lag per keystroke. Use plain HTML inputs with JS event listeners and read values via `JS.InvokeAsync<string>("eval", "document.getElementById('id')?.value")` on submit.
