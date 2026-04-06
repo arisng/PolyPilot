@@ -438,6 +438,14 @@ public partial class CopilotService
                 copilotSession = await GetClientForGroup(groupId).ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
             }
 
+            // Clear IsOrphaned BEFORE registering the event handler — the state may have
+            // been marked orphaned by a sibling reconnect failure (e.g., corrupted session
+            // file caused re-resume to fail, setting IsOrphaned=true on this state).
+            // Without this reset, HandleSessionEvent silently drops all events and the
+            // session appears stuck to mobile clients despite the CLI responding normally.
+            // Order matters: reset first so no early SDK replay events (e.g., session.resume
+            // acknowledgment) are dropped by the IsOrphaned guard in HandleSessionEvent.
+            state.IsOrphaned = false;
             // INV-16: Register event handler BEFORE publishing to state —
             // no window where events arrive with no handler. Matches the pattern
             // in sibling reconnect (CopilotService.cs:2766) and worker revival
