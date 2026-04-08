@@ -1115,6 +1115,50 @@ public class ChatExperienceSafetyTests
         Assert.Contains("SkillDirectories", helperBlock);
     }
 
+    /// <summary>
+    /// Lazy-resume and its fresh-session fallback must include McpServers and SkillDirectories.
+    /// Without these, resumed sessions start without MCP tools (e.g., WorkIQ) until manual /mcp reload.
+    /// </summary>
+    [Fact]
+    public void LazyResumePath_IncludesMcpServersAndSkills()
+    {
+        var source = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Persistence.cs"));
+
+        // Find the EnsureSessionConnectedAsync method containing the lazy-resume logic
+        var methodIdx = source.IndexOf("EnsureSessionConnectedAsync", StringComparison.Ordinal);
+        Assert.True(methodIdx > 0, "EnsureSessionConnectedAsync not found");
+        var block = source.Substring(methodIdx, Math.Min(3000, source.Length - methodIdx));
+
+        // MCP servers must be loaded before creating the resume config
+        Assert.Contains("LoadMcpServers", block);
+        Assert.Contains("LoadSkillDirectories", block);
+
+        // Both the ResumeSessionConfig and the fallback SessionConfig must include MCP
+        Assert.Contains("McpServers = mcpServers", block);
+        Assert.Contains("SkillDirectories = skillDirs", block);
+    }
+
+    /// <summary>
+    /// The public ResumeSessionAsync (sidebar resume, bridge resume) must also include
+    /// McpServers and SkillDirectories so MCP tools work after explicit resume.
+    /// </summary>
+    [Fact]
+    public void SidebarResumePath_IncludesMcpServersAndSkills()
+    {
+        var source = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.cs"));
+
+        var methodIdx = source.IndexOf("public async Task<AgentSessionInfo> ResumeSessionAsync(", StringComparison.Ordinal);
+        Assert.True(methodIdx > 0, "ResumeSessionAsync not found");
+        var block = source.Substring(methodIdx, Math.Min(6000, source.Length - methodIdx));
+
+        Assert.Contains("LoadMcpServers", block);
+        Assert.Contains("LoadSkillDirectories", block);
+        Assert.Contains("McpServers = resumeMcpServers", block);
+        Assert.Contains("SkillDirectories = resumeSkillDirs", block);
+    }
+
     // =========================================================================
     // F. Race Condition & Edge Case Tests
     // =========================================================================
