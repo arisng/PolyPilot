@@ -5,6 +5,21 @@ using PolyPilot.Models;
 
 namespace PolyPilot.Services;
 
+/// <summary>
+/// Action returned by <see cref="CopilotService.EvaluatePollCycle"/> for the poller state machine.
+/// </summary>
+internal enum PollAction
+{
+    /// <summary>File is growing — reset staleness tracking.</summary>
+    ResetStale,
+    /// <summary>File not growing — increment stale counter.</summary>
+    IncrementStale,
+    /// <summary>Staleness threshold reached — force reconnect.</summary>
+    ForceReconnect,
+    /// <summary>Terminal event detected — resume the session.</summary>
+    Resume,
+}
+
 public partial class CopilotService
 {
     /// <summary>
@@ -874,12 +889,13 @@ public partial class CopilotService
                             if (isStillActive)
                             {
                                 // Session is actively running on the copilot server (tool calls in
-                                // flight). Do NOT eager-resume — ResumeSessionAsync kills in-flight
-                                // tool execution on the CLI (the resume replaces the event stream and
-                                // abandons running tools). Instead, mark as processing locally and
+                                // flight). Defer eager-resume to avoid interrupting the CLI while
+                                // it's still writing events. Instead, mark as processing locally and
                                 // start a file-based poller that watches events.jsonl for completion.
-                                // When the CLI finishes, the poller triggers a lazy-resume to pick up
-                                // the results.
+                                // When the CLI finishes (or the file goes stale for PollMaxStaleCycles),
+                                // the poller triggers a lazy-resume to pick up the results.
+                                // Note: in persistent server mode, the headless server survives client
+                                // reconnects, so a force-reconnect after staleness is generally safe.
                                 Debug($"Deferring resume for actively-processing session: {entry.DisplayName} (will poll events.jsonl)");
                                 var capturedState = lazyState;
                                 var capturedName = entry.DisplayName;
@@ -1056,23 +1072,69 @@ public partial class CopilotService
     }
 
     /// <summary>
+    /// Number of consecutive poll cycles with no events.jsonl growth before the poller
+    /// forces a reconnect. At <see cref="PollIntervalSeconds"/>s per cycle,
+    /// 12 cycles = 60s of staleness.
+    /// This catches the common case where the CLI server's session is stuck because
+    /// the client disconnected mid-tool — the server won't write new events until
+    /// a client reconnects, creating a deadlock with the poller waiting for file changes.
+    /// After reconnecting, events either flow (server was alive) or the watchdog's 30s
+    /// resume-quiescence timeout detects the dead session.
+    /// </summary>
+    internal const int PollMaxStaleCycles = 12;
+
+    /// <summary>
+    /// Poll interval in seconds for <see cref="PollEventsAndResumeWhenIdleAsync"/>.
+    /// Used with <see cref="PollMaxStaleCycles"/> to compute the staleness threshold.
+    /// </summary>
+    internal const int PollIntervalSeconds = 5;
+
+    /// <summary>
+    /// Evaluates a single poll cycle and returns the action the poller should take.
+    /// Extracted for testability — the async poller loop calls this each iteration.
+    /// </summary>
+    internal static PollAction EvaluatePollCycle(
+        string? lastEventType, long currentSize, long initialSize, int staleCycles, int maxStaleCycles)
+    {
+        var isTerminal = lastEventType is "session.shutdown";
+        if (isTerminal)
+            return PollAction.Resume;
+
+        // Staleness detection runs regardless of whether we could read lastEventType.
+        // This ensures sessions with empty/corrupt events.jsonl don't wait 30 minutes.
+        if (currentSize <= initialSize)
+            return staleCycles + 1 >= maxStaleCycles ? PollAction.ForceReconnect : PollAction.IncrementStale;
+
+        return PollAction.ResetStale;
+    }
+
+    /// <summary>
     /// Polls events.jsonl for a session that's actively processing on the CLI.
-    /// When the CLI finishes (session.idle or session.shutdown appears, or the file
-    /// goes stale), triggers a lazy-resume to connect and load the response.
+    /// When the CLI finishes (session.shutdown appears, or the file goes stale),
+    /// triggers a lazy-resume to connect and load the response.
     /// 
-    /// IMPORTANT: We cannot call ResumeSessionAsync while the CLI is running tools —
-    /// the resume command kills in-flight tool execution. This poller bridges the gap
-    /// by waiting for the CLI to finish before connecting.
+    /// NOTE: The 60s staleness threshold (<see cref="PollMaxStaleCycles"/> × <see cref="PollIntervalSeconds"/>)
+    /// may trigger a reconnect while a long-running tool is still executing. In persistent server mode,
+    /// the headless server survives client reconnects, so this is generally safe. If the server is alive,
+    /// events replay after reconnect and normal handling resumes. If not, the watchdog's 30s quiescence
+    /// timeout detects the dead session.
     /// </summary>
     private async Task PollEventsAndResumeWhenIdleAsync(
         string sessionName, SessionState state, string sessionId, CancellationToken ct)
     {
         var eventsFile = Path.Combine(SessionStatePath, sessionId, "events.jsonl");
         var maxPollTime = TimeSpan.FromMinutes(30);
-        var pollInterval = TimeSpan.FromSeconds(5);
+        var pollInterval = TimeSpan.FromSeconds(PollIntervalSeconds);
         var started = DateTime.UtcNow;
 
         Debug($"[POLL] Starting events.jsonl poll for '{sessionName}' (id={sessionId})");
+
+        // Track file size for staleness detection — if the file doesn't grow for
+        // PollMaxStaleCycles consecutive checks, the server's session is likely stuck.
+        long initialFileSize = 0;
+        try { if (File.Exists(eventsFile)) initialFileSize = new FileInfo(eventsFile).Length; }
+        catch (IOException ex) { Debug($"[POLL] Initial file size read failed: {ex.Message}"); }
+        int staleCycles = 0;
 
         try
         {
@@ -1100,11 +1162,64 @@ public partial class CopilotService
                 // session.error is also not persisted. Only session.shutdown is reliably on disk.
                 // The watchdog is the primary completion detection for disconnected sessions.
                 var lastEventType = GetLastEventType(eventsFile);
-                if (lastEventType == null) continue;
 
-                var isTerminal = lastEventType is "session.shutdown";
+                long currentSize = 0;
+                try { if (File.Exists(eventsFile)) currentSize = new FileInfo(eventsFile).Length; }
+                catch (IOException ex) { Debug($"[POLL] File size read failed: {ex.Message}"); }
 
-                if (isTerminal)
+                var action = EvaluatePollCycle(lastEventType, currentSize, initialFileSize, staleCycles, PollMaxStaleCycles);
+
+                switch (action)
+                {
+                    case PollAction.ResetStale:
+                        staleCycles = 0;
+                        initialFileSize = currentSize;
+                        continue;
+
+                    case PollAction.IncrementStale:
+                        staleCycles++;
+                        continue;
+
+                    case PollAction.ForceReconnect:
+                        staleCycles++;
+                        Debug($"[POLL-STALE] '{sessionName}' events.jsonl hasn't grown for {staleCycles * PollIntervalSeconds}s " +
+                              $"(size={currentSize}, initial={initialFileSize}) — forcing reconnect");
+                        try
+                        {
+                            // INV-3/INV-12: Capture generation BEFORE async reconnect.
+                            var reconnectGen = Interlocked.Read(ref state.ProcessingGeneration);
+
+                            await EnsureSessionConnectedAsync(sessionName, state, ct);
+                            Debug($"[POLL-STALE] '{sessionName}' reconnected successfully");
+
+                            // Override HasUsedToolsThisTurn so the watchdog can use the 30s
+                            // resume-quiescence timeout instead of 600s. If the server is alive,
+                            // events will replay and HasReceivedEventsSinceResume goes true,
+                            // which skips quiescence — so this override is safe.
+                            // If the server is dead, no events arrive and quiescence fires at 30s.
+                            InvokeOnUI(() =>
+                            {
+                                // Guard: if a new turn started during the async reconnect,
+                                // don't clear state belonging to the new turn.
+                                if (Interlocked.Read(ref state.ProcessingGeneration) != reconnectGen) return;
+                                state.HasUsedToolsThisTurn = false;
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug($"[POLL-STALE] '{sessionName}' reconnect failed: {ex.Message}");
+                            staleCycles = 0; // Reset to avoid immediate re-trigger on next cycle
+                        }
+                        // state.Session is now set (if connect succeeded), next loop iteration
+                        // will return via the state.Session != null check above.
+                        continue;
+
+                    case PollAction.Resume:
+                        // Fall through to terminal handling below
+                        break;
+                }
+
+                // PollAction.Resume: terminal event detected
                 {
                     Debug($"[POLL] '{sessionName}' CLI finished (lastEvent={lastEventType}) — resuming session");
 

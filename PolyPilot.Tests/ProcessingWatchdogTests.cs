@@ -3097,6 +3097,112 @@ public class ProcessingWatchdogTests
             "Case B must read Length from FileInfo");
     }
 
+    [Fact]
+    public void PollMaxStaleCycles_IsReasonable()
+    {
+        // PollMaxStaleCycles × PollIntervalSeconds = total staleness wait before force-reconnect.
+        var totalSeconds = CopilotService.PollMaxStaleCycles * CopilotService.PollIntervalSeconds;
+        Assert.Equal(12, CopilotService.PollMaxStaleCycles);
+        Assert.Equal(5, CopilotService.PollIntervalSeconds);
+        Assert.Equal(60, totalSeconds);
+        Assert.True(CopilotService.PollMaxStaleCycles >= 6,
+            "Below 6 cycles (30s) risks false-positive staleness on normal tool execution gaps");
+        Assert.True(CopilotService.PollMaxStaleCycles <= 24,
+            "Above 24 cycles (120s) delays stuck-session recovery unnecessarily");
+    }
+
+    // --- Behavioral tests for EvaluatePollCycle ---
+
+    [Fact]
+    public void EvaluatePollCycle_TerminalEvent_ReturnsResume()
+    {
+        // session.shutdown is the only terminal event on disk — triggers resume
+        var action = CopilotService.EvaluatePollCycle("session.shutdown", 100, 100, 0, 12);
+        Assert.Equal(PollAction.Resume, action);
+
+        // Even with large file growth, terminal takes priority
+        action = CopilotService.EvaluatePollCycle("session.shutdown", 200, 100, 11, 12);
+        Assert.Equal(PollAction.Resume, action);
+    }
+
+    [Fact]
+    public void EvaluatePollCycle_FileNotGrowing_IncrementsStale()
+    {
+        // File same size as initial — stale, but below threshold
+        var action = CopilotService.EvaluatePollCycle("assistant.turn_end", 100, 100, 5, 12);
+        Assert.Equal(PollAction.IncrementStale, action);
+    }
+
+    [Fact]
+    public void EvaluatePollCycle_StaleCyclesReachThreshold_ForceReconnect()
+    {
+        // At threshold - 1 stale cycles, next cycle triggers reconnect
+        var action = CopilotService.EvaluatePollCycle("assistant.turn_end", 100, 100, 11, 12);
+        Assert.Equal(PollAction.ForceReconnect, action);
+
+        // Already past threshold — still reconnect
+        action = CopilotService.EvaluatePollCycle("assistant.turn_end", 100, 100, 15, 12);
+        Assert.Equal(PollAction.ForceReconnect, action);
+    }
+
+    [Fact]
+    public void EvaluatePollCycle_FileGrowing_ResetsStale()
+    {
+        // File has grown since last baseline — server is alive
+        var action = CopilotService.EvaluatePollCycle("assistant.turn_end", 200, 100, 10, 12);
+        Assert.Equal(PollAction.ResetStale, action);
+    }
+
+    [Fact]
+    public void EvaluatePollCycle_NullLastEventType_StillDetectsStaleness()
+    {
+        // Can't read file, but staleness detection must still work (Finding #5)
+        var action = CopilotService.EvaluatePollCycle(null, 100, 100, 11, 12);
+        Assert.Equal(PollAction.ForceReconnect, action);
+
+        // Below threshold with null event type
+        action = CopilotService.EvaluatePollCycle(null, 100, 100, 5, 12);
+        Assert.Equal(PollAction.IncrementStale, action);
+
+        // File growing with null event type — still resets
+        action = CopilotService.EvaluatePollCycle(null, 200, 100, 10, 12);
+        Assert.Equal(PollAction.ResetStale, action);
+    }
+
+    [Fact]
+    public void EvaluatePollCycle_ExactThresholdBoundary()
+    {
+        // staleCycles = maxStaleCycles - 1 → next increment reaches threshold → ForceReconnect
+        // The check is: staleCycles + 1 >= maxStaleCycles
+        var action = CopilotService.EvaluatePollCycle("assistant.message", 100, 100, 11, 12);
+        Assert.Equal(PollAction.ForceReconnect, action);
+
+        // staleCycles = maxStaleCycles - 2 → not yet at threshold
+        action = CopilotService.EvaluatePollCycle("assistant.message", 100, 100, 10, 12);
+        Assert.Equal(PollAction.IncrementStale, action);
+    }
+
+    [Fact]
+    public void PollStalenessDetection_HasGenerationGuard_InSource()
+    {
+        // INV-3/INV-12: The InvokeOnUI callback that clears HasUsedToolsThisTurn after
+        // force-reconnect MUST check ProcessingGeneration to prevent race with user interaction.
+        var source = File.ReadAllText(
+            Path.Combine(GetRepoRoot(), "PolyPilot", "Services", "CopilotService.Persistence.cs"));
+        var methodIdx = source.IndexOf("private async Task PollEventsAndResumeWhenIdleAsync");
+        Assert.True(methodIdx >= 0, "PollEventsAndResumeWhenIdleAsync must exist");
+        var endIdx = source.IndexOf("\n    }", methodIdx);
+        var pollerBody = source.Substring(methodIdx, endIdx - methodIdx);
+
+        // The force-reconnect path must capture generation before async work
+        Assert.True(pollerBody.Contains("ProcessingGeneration") && pollerBody.Contains("reconnectGen"),
+            "Force-reconnect path must capture ProcessingGeneration before async EnsureSessionConnectedAsync");
+
+        // Must use EvaluatePollCycle for testable decision logic
+        Assert.True(pollerBody.Contains("EvaluatePollCycle"),
+            "Poller must use EvaluatePollCycle for testable decision logic");
+    }
+
     /// <summary>
     /// When HasUsedToolsThisTurn is true and ActiveToolCallCount is 0 but events.jsonl
     /// is fresh (the CLI is still writing), the watchdog must upgrade effectiveTimeout
